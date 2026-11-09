@@ -129,6 +129,8 @@ type Analysis struct {
 	TopMedian     float64
 	BottomMedian  float64
 	DupRows       int
+	DeviantRows   int     // rows whose median is >500 ADU from the frame median or >50% saturated
+	FirstDeviant  int     // first such row, -1 if none
 	ColStepCol    int     // column with the biggest left/right step
 	ColStep       float64 // size of that step
 	Class         string
@@ -161,7 +163,7 @@ func medianU16(v []uint16) float64 {
 
 // Analyze computes everything we want to know about one frame.
 func Analyze(pix []uint16, w, h int) *Analysis {
-	a := &Analysis{W: w, H: h, FirstSatRow: -1}
+	a := &Analysis{W: w, H: h, FirstSatRow: -1, FirstDeviant: -1}
 	if w <= 0 || h <= 0 || len(pix) < w*h {
 		a.Class = "EMPTY"
 		return a
@@ -174,18 +176,21 @@ func Analyze(pix []uint16, w, h int) *Analysis {
 		row := pix[y*w : (y+1)*w]
 		a.RowMedian[y] = medianU16(row)
 		sum, sat := 0.0, 0
+		rmin, rmax := uint16(65535), uint16(0)
 		for _, v := range row {
 			sum += float64(v)
 			if v >= satLevel {
 				sat++
 			}
+			rmin, rmax = min(rmin, v), max(rmax, v)
 		}
 		a.RowMean[y] = sum / float64(w)
 		a.RowSatFrac[y] = float64(sat) / float64(w)
 		if a.FirstSatRow < 0 && a.RowSatFrac[y] > 0.5 {
 			a.FirstSatRow = y
 		}
-		if y > 0 && slices.Equal(row, pix[(y-1)*w:y*w]) {
+		// Constant rows (all 65535, all 0) are equal trivially; only real copies count.
+		if y > 0 && rmin != rmax && slices.Equal(row, pix[(y-1)*w:y*w]) {
 			a.DupRows++
 		}
 	}
@@ -216,6 +221,14 @@ func Analyze(pix []uint16, w, h int) *Analysis {
 	a.TopMedian, a.BottomMedian = median(a.RowMedian[:h/2]), median(a.RowMedian[h/2:])
 	if h == 1 {
 		a.TopMedian = a.RowMedian[0]
+	}
+	for y := 0; y < h; y++ {
+		if math.Abs(a.RowMedian[y]-a.Stats.Median) > 500 || a.RowSatFrac[y] > 0.5 {
+			a.DeviantRows++
+			if a.FirstDeviant < 0 {
+				a.FirstDeviant = y
+			}
+		}
 	}
 	a.ColStepCol, a.ColStep = biggestStep(a.ColMedian)
 	a.findBoundaries()
@@ -422,7 +435,7 @@ func Thumbnail(pix []uint16, w, h, cols, rows int) []string {
 			x0, x1 := c*w/cols, (c+1)*w/cols
 			buf = buf[:0]
 			// subsample large blocks for speed
-			sy := max(1, (y1-y0)/24)
+			sy := 1 // every row, so a thin stripe still shows
 			sx := max(1, (x1-x0)/24)
 			for y := y0; y < y1; y += sy {
 				for x := x0; x < x1; x += sx {
@@ -471,4 +484,30 @@ func (a *Analysis) BitLine() string {
 		fmt.Fprintf(&sb, " %.0f", 100*a.BitFrac[b])
 	}
 	return sb.String()
+}
+
+// ApplyDarkRules tightens the classification for closed-shutter (bias/dark)
+// frames, where any structure or level far from the factory black level
+// (~900-1000 ADU) is a fault: elevated level, top/bottom gradient, steps of
+// 1000 ADU or more, and rows that deviate from the frame median.
+func (a *Analysis) ApplyDarkRules() {
+	if a.Class != "OK" && a.Class != "STEP" {
+		return
+	}
+	med := a.Stats.Median
+	switch {
+	case med < 300 || med > 3000:
+		a.Class = "ELEVATED"
+		a.Notes = append(a.Notes, fmt.Sprintf("bias/dark median %.0f ADU is outside 300..3000 (factory black level ~900-1000)", med))
+	case len(a.Boundaries) > 0 && maxStep(a.Boundaries) >= 1000:
+		a.Class = "CORRUPT"
+	case math.Abs(a.TopMedian-a.BottomMedian) > 1000:
+		a.Class = "GRADIENT"
+		a.Notes = append(a.Notes, fmt.Sprintf("top/bottom halves differ by %.0f ADU", math.Abs(a.TopMedian-a.BottomMedian)))
+	case a.DeviantRows > 0:
+		a.Class = "STEP"
+	}
+	if a.DeviantRows > 0 {
+		a.Notes = append(a.Notes, fmt.Sprintf("%d rows deviate by >500 ADU from the frame median (first: row %d)", a.DeviantRows, a.FirstDeviant))
+	}
 }

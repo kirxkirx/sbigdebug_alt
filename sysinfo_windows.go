@@ -315,3 +315,92 @@ func restoreSBIGRegistry(before RegSnapshot) []string {
 	}
 	return out
 }
+
+// --- console / path / debug-log registry helpers ---
+
+var (
+	procFlushConsoleInputBuffer = modKernel32.NewProc("FlushConsoleInputBuffer")
+	procGetShortPathNameW       = modKernel32.NewProc("GetShortPathNameW")
+	procRegCreateKeyExW         = modAdvapi32.NewProc("RegCreateKeyExW")
+)
+
+// flushConsoleInput discards keys typed during the run, so that the final
+// "Press Enter" really waits for the operator.
+func flushConsoleInput() {
+	h, _, _ := procGetStdHandle.Call(uintptr(^uint32(10 - 1))) // STD_INPUT_HANDLE
+	if h != 0 && h != ^uintptr(0) {
+		procFlushConsoleInputBuffer.Call(h)
+	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7E {
+			return false
+		}
+	}
+	return true
+}
+
+// ansiPath returns a form of path that the ANSI (char*) SBIG driver can open:
+// the path itself if it is plain ASCII, else the 8.3 short form of its folder.
+func ansiPath(p string) (string, bool) {
+	if isASCII(p) && len(p) < 260 {
+		return p, true
+	}
+	dir, file := filepath.Split(p)
+	w, err := syscall.UTF16PtrFromString(dir)
+	if err != nil {
+		return "", false
+	}
+	buf := make([]uint16, 1024)
+	n, _, _ := procGetShortPathNameW.Call(uintptr(unsafe.Pointer(w)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if n == 0 || int(n) >= len(buf) {
+		return "", false
+	}
+	sp := filepath.Join(syscall.UTF16ToString(buf[:n]), file)
+	if !isASCII(sp) || len(sp) >= 260 {
+		return "", false
+	}
+	return sp, true
+}
+
+// setDebugLogRegistry writes the values the SBIG driver reads when it handles
+// CC_DEBUG_LOG: HKCU\Software\SBIG\SBIGUDRV\DebugLog {CcFlags, mcFlags, fceFlags,
+// ioFlags (DWORD), FilePathName (string)}. The caller restores the registry.
+func setDebugLogRegistry(path string, flags [4]uint32) error {
+	sub, _ := syscall.UTF16PtrFromString(`Software\SBIG\SBIGUDRV\DebugLog`)
+	var h syscall.Handle
+	var disp uint32
+	r, _, _ := procRegCreateKeyExW.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(sub)), 0, 0, 0,
+		uintptr(syscall.KEY_SET_VALUE|syscall.KEY_QUERY_VALUE), 0, uintptr(unsafe.Pointer(&h)), uintptr(unsafe.Pointer(&disp)))
+	if r != 0 {
+		return fmt.Errorf("RegCreateKeyEx: error %d", r)
+	}
+	defer syscall.RegCloseKey(h)
+	set := func(name string, typ uint32, data []byte) error {
+		n, _ := syscall.UTF16PtrFromString(name)
+		rc, _, _ := procRegSetValueExW.Call(uintptr(h), uintptr(unsafe.Pointer(n)), 0, uintptr(typ),
+			uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)))
+		if rc != 0 {
+			return fmt.Errorf("RegSetValueEx %s: error %d", name, rc)
+		}
+		return nil
+	}
+	for i, name := range []string{"CcFlags", "mcFlags", "fceFlags", "ioFlags"} {
+		b := make([]byte, 4)
+		le.PutUint32(b, flags[i])
+		if err := set(name, syscall.REG_DWORD, b); err != nil {
+			return err
+		}
+	}
+	u, err := syscall.UTF16FromString(path)
+	if err != nil {
+		return err
+	}
+	b := make([]byte, 2*len(u))
+	for i, c := range u {
+		le.PutUint16(b[2*i:], c)
+	}
+	return set("FilePathName", syscall.REG_SZ, b)
+}

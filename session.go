@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -32,6 +33,10 @@ type Session struct {
 	offsets  []OffsetSample
 	nframe   int
 	restSec  int
+	// nvPending is true while camera customer options (stored in the camera) differ
+	// from their original values; the signal handler then refuses to os.Exit.
+	nvPending    atomic.Bool
+	origOptsText atomic.Value
 }
 
 type FrameResult struct {
@@ -65,6 +70,8 @@ type FrameResult struct {
 	File        string            `json:"file"`
 	PreExpS     float64           `json:"pre_exposure_s"`
 	Exact65535  bool              `json:"all_exactly_65535"`
+	Dark        bool              `json:"shutter_closed"`
+	LinesRead   int               `json:"lines_read"`
 }
 
 type OffsetSample struct {
@@ -224,9 +231,6 @@ func (s *Session) Info() {
 			s.pf("Firmware feature %s: %v\n", name, err)
 		}
 	}
-	if rip, err := c.ReadoutInProgress(); err == nil {
-		s.pf("Readout in progress: %v\n", rip)
-	}
 	s.DumpDCPs("Driver control parameters (start)")
 	s.SampleOffsets("info", 3)
 }
@@ -270,6 +274,9 @@ func shortErr(err error) string {
 
 // SampleOffsets reads the camera's own bias measurement (CC_READ_OFFSET2) n times.
 func (s *Session) SampleOffsets(label string, n int) {
+	if s.aborted() {
+		return
+	}
 	var vals []string
 	for k := 0; k < n; k++ {
 		o, rms, err := s.cam.ReadOffset2()
@@ -316,6 +323,9 @@ func (s *Session) SetDCPTemp(i int, v uint32) error {
 }
 
 func (s *Session) SetOptionsTemp(o CustomerOptions) error {
+	if s.aborted() {
+		return errAborted
+	}
 	cur, err := s.cam.GetCustomerOptions()
 	if err != nil {
 		return fmt.Errorf("cannot read customer options (%v) - not changing them", err)
@@ -323,6 +333,8 @@ func (s *Session) SetOptionsTemp(o CustomerOptions) error {
 	if s.origOpts == nil {
 		s.origOpts = &cur
 	}
+	s.origOptsText.Store(s.origOpts.String())
+	s.nvPending.Store(true)
 	if err := s.cam.SetCustomerOptions(o); err != nil {
 		return err
 	}
@@ -334,41 +346,61 @@ func (s *Session) SetOptionsTemp(o CustomerOptions) error {
 	return err
 }
 
-// RestoreAll puts every changed setting back and verifies it.
+// RestoreAll puts every changed setting back and verifies it. Camera options
+// (stored in the camera) go first: they are the ones that would outlive us.
 func (s *Session) RestoreAll() bool {
-	ok := true
-	if len(s.origDCP) == 0 && s.origOpts == nil {
-		return true
-	}
+	ok := s.restoreOptions()
 	keys := make([]int, 0, len(s.origDCP))
 	for k := range s.origDCP {
 		keys = append(keys, k)
 	}
 	sort.Ints(keys)
 	for _, i := range keys {
-		v := s.origDCP[i]
-		err := s.cam.SetDCP(i, v)
-		rb, err2 := s.cam.GetDCP(i)
-		if err != nil || err2 != nil || rb != v {
+		if !s.restoreDCP(i) {
 			ok = false
-			s.pf("  RESTORE FAILED for %s (want %d, got %d, err %v %v)\n", dcpNames[i], v, rb, err, err2)
-			continue
-		}
-		s.pf("  restored %s = %d\n", dcpNames[i], v)
-		delete(s.origDCP, i)
-	}
-	if s.origOpts != nil {
-		err := s.cam.SetCustomerOptions(*s.origOpts)
-		rb, err2 := s.cam.GetCustomerOptions()
-		if err != nil || err2 != nil || rb != *s.origOpts {
-			ok = false
-			s.pf("  RESTORE FAILED for customer options (want %s, got %s, err %v %v)\n", *s.origOpts, rb, err, err2)
-		} else {
-			s.pf("  restored customer options: %s\n", rb)
-			s.origOpts = nil
 		}
 	}
 	return ok
+}
+
+// restoreDCP restores one driver control parameter changed with SetDCPTemp.
+func (s *Session) restoreDCP(i int) bool {
+	v, changed := s.origDCP[i]
+	if !changed {
+		return true
+	}
+	err := s.cam.SetDCP(i, v)
+	rb, err2 := s.cam.GetDCP(i)
+	if err != nil || err2 != nil || rb != v {
+		s.pf("  RESTORE FAILED for %s (want %d, got %d, err %v %v)\n", dcpNames[i], v, rb, err, err2)
+		return false
+	}
+	s.pf("  restored %s = %d\n", dcpNames[i], v)
+	delete(s.origDCP, i)
+	return true
+}
+
+// restoreOptions restores the camera customer options changed with SetOptionsTemp.
+func (s *Session) restoreOptions() bool {
+	if s.origOpts == nil {
+		return true
+	}
+	var err, err2 error
+	var rb CustomerOptions
+	for try := 0; try < 3; try++ { // these live in the camera: try hard
+		err = s.cam.SetCustomerOptions(*s.origOpts)
+		rb, err2 = s.cam.GetCustomerOptions()
+		if err == nil && err2 == nil && rb == *s.origOpts {
+			s.pf("  restored customer options: %s\n", rb)
+			s.origOpts = nil
+			s.nvPending.Store(false)
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.pf("  RESTORE FAILED for customer options (want %s, got %s, err %v %v)\n", *s.origOpts, rb, err, err2)
+	s.pf("  -> please set them back in CCDOps: Camera Setup -> Customer Options: %s\n", *s.origOpts)
+	return false
 }
 
 // --- exposures ---
@@ -381,27 +413,49 @@ func (s *Session) TakeFrame(exp string, spec ExposureSpec) *FrameResult {
 	n := s.nframe
 	s.pf("\n--- frame %d [%s] %s ---\n", n, exp, spec.Describe())
 	f, err := s.cam.Expose(spec, s.aborted)
+	if errors.Is(err, errAborted) {
+		// Do nothing slow here: restoring settings and closing must start at once.
+		s.pl("  frame aborted")
+		r := &FrameResult{N: n, Experiment: exp, Spec: spec.Describe(), Time: time.Now().Format(time.RFC3339), Class: "ABORTED", Dark: spec.Dark}
+		s.results = append(s.results, r)
+		return r
+	}
 	if f == nil {
 		s.pf("  EXPOSURE FAILED: %v\n", err)
-		r := &FrameResult{N: n, Experiment: exp, Spec: spec.Describe(), Time: time.Now().Format(time.RFC3339), Class: "ERROR", Errors: []string{fmt.Sprint(err)}}
+		r := &FrameResult{N: n, Experiment: exp, Spec: spec.Describe(), Time: time.Now().Format(time.RFC3339), Class: "ERROR", Errors: []string{fmt.Sprint(err)}, Dark: spec.Dark}
 		s.results = append(s.results, r)
+		s.WriteJSON()
 		return r
 	}
 	if err != nil {
 		f.Errors = append(f.Errors, err.Error())
-		s.pf("  readout error: %v (analysing the lines that were read)\n", err)
+		s.pf("  readout error: %v (analysing the %d lines that were read)\n", err, f.LinesRead)
 	}
-	return s.analyseFrame(n, exp, f)
+	r := s.analyseFrame(n, exp, f)
+	s.WriteJSON() // keep summary.json/frames.csv current in case the run is killed
+	return r
 }
 
 func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
+	partial := f.LinesRead < f.H
+	if partial {
+		f.H = f.LinesRead // analyse and save only what was read
+		f.Pix = f.Pix[:f.W*f.H]
+	}
 	a := Analyze(f.Pix, f.W, f.H)
+	if f.Spec.Dark {
+		a.ApplyDarkRules()
+	}
+	if partial {
+		a.Class = "PARTIAL"
+	}
 	r := &FrameResult{N: n, Experiment: exp, Spec: f.Spec.Describe(), Time: f.Start.Format(time.RFC3339),
 		Class: a.Class, W: f.W, H: f.H, Stats: a.Stats, Boundaries: a.Boundaries, Segments: a.Segments,
 		Notes: a.Notes, BitFrac: a.BitFrac, FirstSatRow: a.FirstSatRow, TopMed: a.TopMedian, BottomMed: a.BottomMedian,
 		LeftMed: a.LeftMedian, RightMed: a.RightMedian,
 		IntegrS: f.IntegrDone.Seconds(), ReadoutS: f.ReadoutTime.Seconds(), Errors: f.Errors,
-		CCDTempC: f.TempAfter.CCDTemp, HeatsinkC: f.TempAfter.HeatsinkTemp, PowerLow: f.PowerLowAfter}
+		CCDTempC: f.TempAfter.CCDTemp, HeatsinkC: f.TempAfter.HeatsinkTemp, PowerLow: f.PowerLowAfter,
+		Dark: f.Spec.Dark, LinesRead: f.LinesRead}
 	r.ComFailed = int64(f.LinkAfter.ComFailed) - int64(f.LinkBefore.ComFailed)
 	r.Exact65535 = a.Stats.Full65535Frac > 0.999
 	phases := ""
@@ -433,7 +487,7 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 	for _, l := range Thumbnail(f.Pix, f.W, f.H, 64, 16) {
 		s.pl(l)
 	}
-	if s.dir != "" {
+	if s.dir != "" && f.H > 0 {
 		base := fmt.Sprintf("frame%03d_%s", n, sanitize(exp))
 		if s.saveFITS {
 			cards := s.fitsCards(f, exp, r)

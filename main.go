@@ -69,6 +69,7 @@ func main() {
 	disableQuickEdit()
 	code := run(o)
 	if !o.noPause && ownsConsole() {
+		flushConsoleInput() // ignore keys typed during the run
 		fmt.Print("\nPress Enter to close this window...")
 		bufio.NewReader(os.Stdin).ReadString('\n')
 	}
@@ -83,6 +84,11 @@ func run(o options) int {
 		return analyzeFiles(files, o)
 	}
 	in := bufio.NewReader(os.Stdin)
+	if o.analyze {
+		fmt.Print("FITS/XISF file(s) or a folder: ")
+		l, _ := in.ReadString('\n')
+		return analyzeFiles(splitPaths(l), o)
+	}
 	if interactive {
 		fmt.Println(`
 Close NINA / CCDOps / MaxIm (or disconnect the camera in them) before using options 1-4.
@@ -113,7 +119,7 @@ Close NINA / CCDOps / MaxIm (or disconnect the camera in them) before using opti
 				o.frames = n
 			}
 		case "5":
-			fmt.Print("FITS file(s) or a folder (paths separated by ; or drag them into this window): ")
+			fmt.Print("FITS/XISF file or folder (drag ONE file or a folder into this window, then Enter): ")
 			l, _ := in.ReadString('\n')
 			return analyzeFiles(splitPaths(l), o)
 		case "6":
@@ -145,21 +151,35 @@ func askCustom(in *bufio.Reader) string {
 
 func splitPaths(l string) []string {
 	var out []string
-	l = strings.TrimSpace(l)
-	// Windows drag&drop quotes paths with spaces.
-	for _, part := range strings.FieldsFunc(l, func(r rune) bool { return r == ';' || r == '\n' }) {
-		p := strings.Trim(strings.TrimSpace(part), `"`)
-		if p != "" {
-			out = append(out, p)
+	for _, part := range strings.FieldsFunc(l, func(r rune) bool { return r == ';' || r == '\n' || r == '\r' }) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
 		}
-	}
-	if len(out) == 1 && strings.Count(l, `"`) >= 4 { // several quoted paths separated by spaces
-		out = nil
-		for _, f := range strings.Split(l, `"`) {
-			if f = strings.TrimSpace(f); f != "" {
-				out = append(out, f)
+		if _, err := os.Stat(strings.Trim(part, `"`)); err == nil { // a typed path with spaces
+			out = append(out, strings.Trim(part, `"`))
+			continue
+		}
+		// Several dropped files: space separated, quoted only when they contain spaces.
+		var cur strings.Builder
+		inQ := false
+		flush := func() {
+			if cur.Len() > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
 			}
 		}
+		for _, r := range part {
+			switch {
+			case r == '"':
+				inQ = !inQ
+			case (r == ' ' || r == '\t') && !inQ:
+				flush()
+			default:
+				cur.WriteRune(r)
+			}
+		}
+		flush()
 	}
 	return out
 }
@@ -237,6 +257,9 @@ func makeOutDir(o options) string {
 	}
 	bases = append(bases, os.TempDir())
 	for _, b := range bases {
+		if protectedDir(b) {
+			continue
+		}
 		d := filepath.Join(b, name)
 		if err := os.MkdirAll(d, 0o755); err == nil {
 			return d
@@ -245,7 +268,26 @@ func makeOutDir(o options) string {
 	return ""
 }
 
+// protectedDir: Windows silently redirects writes of a non-elevated 32-bit
+// program under these folders to VirtualStore, where nobody would find them.
+func protectedDir(p string) bool {
+	lp := strings.ToLower(filepath.Clean(p))
+	for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot", "ProgramData"} {
+		if v := os.Getenv(env); v != "" {
+			lv := strings.ToLower(filepath.Clean(v))
+			if lp == lv || strings.HasPrefix(lp, lv+string(filepath.Separator)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func runCamera(o options) int {
+	if o.sets != "" && !o.info && o.custom == "" && !o.quick {
+		fmt.Println("-set is only supported with -custom or -quick (the full test changes settings itself)")
+		return 2
+	}
 	dir := makeOutDir(o)
 	var logf *os.File
 	var out io.Writer = os.Stdout
@@ -287,15 +329,27 @@ func runCamera(o options) int {
 		origDCP: map[int]uint32{}, info: map[string]interface{}{"started": time.Now().Format(time.RFC3339)}}
 
 	// Ctrl+C / window close: stop at the next safe point, restore settings, close the camera.
-	sig := make(chan os.Signal, 2)
+	// While camera customer options (stored in the camera) are changed, further
+	// interrupts do not kill the program until they are restored.
+	sig := make(chan os.Signal, 4)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-sig
-		fmt.Println("\n*** Interrupt: finishing the current driver call, then restoring settings and closing the camera ***")
-		s.abort.Store(true)
-		<-sig
-		fmt.Println("*** Second interrupt: exiting immediately (settings may not be restored) ***")
-		os.Exit(130)
+		n := 0
+		for sg := range sig {
+			n++
+			if n == 1 {
+				fmt.Println("\n*** Interrupt: finishing the current driver call, then restoring settings and closing the camera ***")
+				s.abort.Store(true)
+				continue
+			}
+			if s.nvPending.Load() && (sg == syscall.SIGTERM || n < 4) {
+				fmt.Printf("\n*** Camera customer options are changed IN THE CAMERA right now (original: %v) - restoring them, please wait"+
+					" (press Ctrl+C %d more time(s) to quit anyway, then reset them in CCDOps) ***\n", s.origOptsText.Load(), 4-n)
+				continue
+			}
+			fmt.Println("*** Exiting immediately (settings may not be restored) ***")
+			os.Exit(130)
+		}
 	}()
 
 	defer func() {
@@ -310,7 +364,9 @@ func runCamera(o options) int {
 			fmt.Fprintln(out, "All changed settings are back to their original values.")
 		}
 		if eventLog != "" {
-			_ = cam.DebugLog(eventLog, 0, 0, 0, 0) // stop logging
+			// The registry already holds the original log settings again: reloading them
+			// while the device is still open switches our logging off.
+			_ = cam.ReloadDebugLog()
 		}
 		cam.Shutdown()
 		for _, l := range restoreSBIGRegistry(regSnap) {
@@ -323,33 +379,45 @@ func runCamera(o options) int {
 		fmt.Fprintf(out, "Results saved in: %s\n", dir)
 	}()
 
-	// The driver's debug log with DLF_FCE_CAMERA records the STX/STXL camera's own event
-	// messages, e.g. "LV TE Off" (input voltage too low, cooler switched off).
-	if (o.driverLog || !o.noEventLog) && dir != "" {
-		if err := cam.OpenDriver(); err == nil {
-			eventLog, _ = filepath.Abs(filepath.Join(dir, "sbigudrv_debug.log"))
-			if o.driverLog {
-				err = cam.DebugLog(eventLog, 0x0F, 0x1F, 0x83, 0)
-			} else {
-				err = cam.DebugLog(eventLog, 0, 0, 0x80, 0)
-			}
-			fmt.Fprintf(out, "SBIG driver debug log (camera events%s) -> %s (%v)\n", map[bool]string{true: " + commands", false: ""}[o.driverLog], eventLog, err)
-			if err != nil {
-				eventLog = ""
-			}
-		}
-	}
 	if err := s.Connect(); err != nil {
 		fmt.Fprintln(out, "ERROR:", err)
 		return 3
 	}
+	// Camera event messages (e.g. "LV TE Off" = input voltage too low): the driver
+	// takes its debug-log settings only from HKCU\Software\SBIG\SBIGUDRV\DebugLog and
+	// only while a device is open. Write them, let the driver load them, and put the
+	// user's registry back straight away (the driver keeps the settings in memory).
+	if (o.driverLog || !o.noEventLog) && dir != "" && !s.aborted() {
+		long, _ := filepath.Abs(filepath.Join(dir, "sbigudrv_debug.log"))
+		if p, ok := ansiPath(long); !ok {
+			fmt.Fprintln(out, "SBIG driver camera-event log: skipped (output path not representable for the driver)")
+		} else {
+			flags := [4]uint32{0, 0, 0x80, 0} // DLF_FCE_CAMERA: camera event messages
+			if o.driverLog {
+				flags = [4]uint32{0x0F, 0x1F, 0x83, 0}
+			}
+			if err := setDebugLogRegistry(p, flags); err != nil {
+				fmt.Fprintf(out, "SBIG driver camera-event log: not enabled (%v)\n", err)
+			} else {
+				err := cam.ReloadDebugLog()
+				restored := restoreSBIGRegistry(regSnap)
+				fmt.Fprintf(out, "SBIG driver camera-event log -> %s (%v; %d temporary registry value(s) put back)\n", p, errOrOK(err), len(restored))
+				if err == nil {
+					eventLog = long
+				}
+			}
+		}
+	}
 	s.Info()
-	if o.info {
+	if o.info || s.aborted() {
 		return 0
 	}
 	// Temporary settings for quick/custom runs.
 	if o.sets != "" {
 		for _, kv := range strings.Split(o.sets, ",") {
+			if s.aborted() {
+				break
+			}
 			k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
 			if !ok {
 				continue
@@ -372,9 +440,10 @@ func runCamera(o options) int {
 			fmt.Fprintln(out, "bad -custom:", err)
 			return 2
 		}
-		s.heading("custom series", o.custom+" "+o.sets)
-		s.series("custom", spec, o.frames)
-		s.SampleOffsets("after custom series", 3)
+		if s.heading("custom series", o.custom+" "+o.sets) {
+			s.series("custom", spec, o.frames)
+			s.SampleOffsets("after custom series", 3)
+		}
 	case o.quick:
 		s.QuickTest(o.frames)
 	default:
@@ -462,4 +531,11 @@ func summarizeEventLog(out io.Writer, path string) {
 			break
 		}
 	}
+}
+
+func errOrOK(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return err.Error()
 }

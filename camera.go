@@ -486,13 +486,10 @@ func (c *Camera) FeatureSupported(ffr uint32) (bool, error) {
 	return L_QueryFeatureSupportedResults.U16(r, "result") != 0, nil
 }
 
-func (c *Camera) ReadoutInProgress() (bool, error) {
-	r := L_GetReadoutInProgressResults.New()
-	if err := c.cmd(CC_READOUT_IN_PROGRESS, nil, r); err != nil {
-		return false, err
-	}
-	return L_GetReadoutInProgressResults.U16(r, "RIP") != 0, nil
-}
+// NOTE: never send CC_READOUT_IN_PROGRESS (106). In the shipped SBIGUDrv builds
+// (x64 4.99 Build 8, x86 5.0.2) its switch case falls through into
+// CC_SET_TEMPERATURE_REGULATION, which dereferences Params: NULL crashes the
+// process, and a zeroed buffer would switch the cooler off.
 
 type USBCam struct {
 	Found  bool
@@ -534,16 +531,12 @@ func (c *Camera) MiscControl(fan, shutter, led uint16) error {
 	return c.cmd(CC_MISCELLANEOUS_CONTROL, p, nil)
 }
 
-// DebugLog enables the SBIG driver's own debug log file (flags 0 disables).
-func (c *Camera) DebugLog(path string, cc, mc, fce, io uint16) error {
-	L := L_DebugLogParams
-	p := L.New()
-	L.Put16(p, "ccFlags", cc)
-	L.Put16(p, "mcFlags", mc)
-	L.Put16(p, "fceFlags", fce)
-	L.Put16(p, "ioFlags", io)
-	L.PutStr(p, "logFilePathName", 1024, path)
-	return c.cmd(CC_DEBUG_LOG, p, nil)
+// ReloadDebugLog sends CC_DEBUG_LOG. The shipped DLLs ignore the parameters and
+// (re)load CcFlags/mcFlags/fceFlags/ioFlags/FilePathName from
+// HKCU\Software\SBIG\SBIGUDRV\DebugLog; the command is only accepted while a
+// device is open. A zeroed parameter block is passed in case a build reads it.
+func (c *Camera) ReloadDebugLog() error {
+	return c.cmd(CC_DEBUG_LOG, L_DebugLogParams.New(), nil)
 }
 
 // --- exposures ---
@@ -578,7 +571,7 @@ func (s ExposureSpec) Describe() string {
 		extra += fmt.Sprintf(" expflags=0x%08x", s.ExpFlags)
 	}
 	if s.LineDelay > 0 {
-		extra += fmt.Sprintf(" linedelay=%v", s.LineDelay)
+		extra += fmt.Sprintf(" linedelay=%.1fms", float64(s.LineDelay.Microseconds())/1000)
 	}
 	if s.Leave {
 		extra += " shutter-not-moved"
@@ -607,6 +600,7 @@ type Frame struct {
 	DCPs          map[string]uint32
 	Phases        [4]time.Duration // time seen in XES_IDLE, PRE_EXP (RBI preflash / shutter), INTEGRATING, POST_EXP
 	PhasesValid   bool
+	LinesRead     int // lines actually read (== H for a complete frame)
 }
 
 var errAborted = errors.New("aborted by user")
@@ -675,9 +669,15 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 			return nil, errAborted
 		}
 		var status uint16
+		useV1 := c.noStatus2
 		if !c.noStatus2 {
 			if err := c.cmd(CC_QUERY_COMMAND_STATUS2, q, qr); err != nil {
-				c.noStatus2 = true // older driver/firmware: fall back below
+				useV1 = true
+				if isCode(err, CE_UNKNOWN_COMMAND, CE_BAD_CAMERA_COMMAND) {
+					c.noStatus2 = true // driver/firmware without command 61
+				} else if len(f.Errors) < 20 {
+					f.Errors = append(f.Errors, "status poll: "+err.Error())
+				}
 			} else {
 				status = L_QueryCommandStatusResults2.U16(qr, "status")
 				now := time.Now()
@@ -686,7 +686,7 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 				last = now
 			}
 		}
-		if c.noStatus2 {
+		if useV1 {
 			r1 := L_QueryCommandStatusResults.New()
 			if err := c.cmd(CC_QUERY_COMMAND_STATUS, q, r1); err != nil {
 				c.endExposure(ABORT_DONT_END)
@@ -717,6 +717,8 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	L_StartReadoutParams.Put16(sr, "width", uint16(w))
 	t0 := time.Now()
 	if err := c.cmd(CC_START_READOUT, sr, nil); err != nil {
+		er := L_EndReadoutParams.New()
+		_ = c.cmd(CC_END_READOUT, er, nil)
 		return nil, err
 	}
 	rl := L_ReadoutLineParams.New()
@@ -743,6 +745,7 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 		for x := range row {
 			row[x] = le.Uint16(line[2*x:])
 		}
+		f.LinesRead = y + 1
 		if s.LineDelay > 0 {
 			time.Sleep(s.LineDelay)
 		}

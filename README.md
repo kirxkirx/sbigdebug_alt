@@ -84,9 +84,10 @@ Each exe only ever loads a DLL of its own bitness.
   - The RBI preflash parameters.
   - A warning if cooling is on but the cooler gets 0 % power. The STXL switches its cooler off at ≤ 10.25 V input.
 - **Camera events**: the SBIG driver's debug log records the camera's own event messages, such as
-  "LV TE Off" (input voltage too low). The log goes to `sbigudrv_debug.log` and is summarised at the end.
-  The SBIG registry keys under `HKCU\Software\SBIG` are snapshotted first, and anything the driver
-  changes there is put back.
+  "LV TE Off" (input voltage too low). The driver only takes its log settings from
+  `HKCU\Software\SBIG\SBIGUDRV\DebugLog`. So sbigdiag writes them there, lets the driver load them,
+  and immediately puts the registry back the way it was; it checks again at exit.
+  The log goes to `sbigudrv_debug.log` and is summarised at the end.
 - **All 23 driver control parameters** (`DCP_*`). Any value that differs from the documented default is flagged.
 
 ## What it measures in each frame
@@ -152,6 +153,11 @@ Notes:
   the factory value only if one of them was already on. Every change is read back,
   restored and verified straight away.
 - Cooling, fan and filter wheel are never touched.
+- Ctrl+C or closing the window stops the run at the next driver call, restores everything and closes the camera.
+  While camera options are changed (a few seconds per experiment), further Ctrl+C presses are held back
+  until they are restored. No new experiment starts after an interrupt.
+- `CC_READOUT_IN_PROGRESS` is never sent: in the shipped SBIG drivers its handler falls through into
+  "set temperature regulation" and crashes (or switches the cooler off).
 
 ## Command line
 
@@ -159,7 +165,7 @@ Notes:
 sbigdiag-win64.exe -full                    full test without the menu
 sbigdiag-win64.exe -quick -n 10             10 bias frames
 sbigdiag-win64.exe -custom "exp=5,bin=1,dark=1,top=0,height=200" -n 3
-sbigdiag-win64.exe -custom "exp=0" -set "VDD_OPTIMIZED=0,USB_FIFO_ENABLE=0" -n 5
+sbigdiag-win64.exe -custom "exp=0" -set "VDD_OPTIMIZED=0,USB_FIFO_ENABLE=0" -n 5   (-set: only with -custom/-quick)
 sbigdiag-win64.exe -info                    information only
 sbigdiag-win64.exe bad1.fits bad2.xisf      analyse existing files (FITS or uncompressed XISF)
   -dll <path>      use a specific SBIGUDrv.dll (e.g. a different driver version)

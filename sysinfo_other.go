@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -19,3 +20,9 @@ type RegSnapshot map[string]struct{}
 
 func snapshotSBIGRegistry() RegSnapshot               { return RegSnapshot{} }
 func restoreSBIGRegistry(before RegSnapshot) []string { return nil }
+
+func flushConsoleInput()               {}
+func ansiPath(p string) (string, bool) { return p, true }
+func setDebugLogRegistry(string, [4]uint32) error {
+	return errors.New("only on Windows")
+}

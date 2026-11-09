@@ -21,7 +21,7 @@ func formatCard(c fitsCard) string {
 	var v string
 	switch x := c.value.(type) {
 	case nil:
-		return fmt.Sprintf("%-80.80s", fmt.Sprintf("%-8.8s %s", c.key, c.cmt))
+		return card80(fmt.Sprintf("%-8.8s %s", c.key, c.cmt))
 	case bool:
 		if x {
 			v = fmt.Sprintf("%20s", "T")
@@ -52,7 +52,22 @@ func formatCard(c fitsCard) string {
 	if c.cmt != "" {
 		line += " / " + c.cmt
 	}
-	return fmt.Sprintf("%-80.80s", line)
+	return card80(line)
+}
+
+// card80 makes an exactly 80-byte FITS card of printable ASCII (FITS forbids
+// other bytes; e.g. "µs" from time.Duration would otherwise shift the header).
+func card80(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] < 0x20 || b[i] > 0x7E {
+			b[i] = '?'
+		}
+	}
+	if len(b) > 80 {
+		b = b[:80]
+	}
+	return string(b) + strings.Repeat(" ", 80-len(b))
 }
 
 // WriteFITS writes a 16-bit unsigned image (BITPIX=16, BZERO=32768).

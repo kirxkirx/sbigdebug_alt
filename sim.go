@@ -22,6 +22,7 @@ type simTransport struct {
 	healthy               bool // -simulate-healthy: no failure
 	exposing              bool
 	reading               bool
+	open                  bool
 }
 
 func newSimTransport(healthy bool) *simTransport {
@@ -52,7 +53,22 @@ func (s *simTransport) modeDims(m uint16) (int, int) {
 
 func (s *simTransport) Call(cmd uint16, p, r []byte) uint16 {
 	switch cmd {
-	case CC_OPEN_DRIVER, CC_CLOSE_DRIVER, CC_OPEN_DEVICE, CC_CLOSE_DEVICE, CC_MISCELLANEOUS_CONTROL, CC_DEBUG_LOG:
+	case CC_READOUT_IN_PROGRESS:
+		// The real SBIGUDrv falls through into CC_SET_TEMPERATURE_REGULATION here and
+		// crashes on NULL params - sbigdiag must never send it.
+		panic("CC_READOUT_IN_PROGRESS must never be sent (crashes the real driver)")
+	case CC_OPEN_DEVICE:
+		s.open = true
+		return 0
+	case CC_CLOSE_DEVICE:
+		s.open = false
+		return 0
+	case CC_DEBUG_LOG:
+		if !s.open {
+			return 28 // CE_DEVICE_NOT_OPEN, as the real driver does
+		}
+		return 0
+	case CC_OPEN_DRIVER, CC_CLOSE_DRIVER, CC_MISCELLANEOUS_CONTROL:
 		return 0
 	case CC_ESTABLISH_LINK:
 		L_EstablishLinkResults.Put16(r, "cameraType", 17)
@@ -152,7 +168,7 @@ func (s *simTransport) Call(cmd uint16, p, r []byte) uint16 {
 		return 0
 	case CC_BIT_IO:
 		return 0
-	case CC_QUERY_FEATURE_SUPPORTED, CC_READOUT_IN_PROGRESS:
+	case CC_QUERY_FEATURE_SUPPORTED:
 		return 0
 	case CC_QUERY_USB3:
 		L := L_QueryUSBResults3
