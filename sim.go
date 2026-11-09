@@ -21,6 +21,7 @@ type simTransport struct {
 	rng                   *rand.Rand
 	healthy               bool // -simulate-healthy: no failure
 	exposing              bool
+	reading               bool
 }
 
 func newSimTransport(healthy bool) *simTransport {

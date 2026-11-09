@@ -322,8 +322,9 @@ func (s *Session) Interpret() {
 	// Offsets measured by the camera.
 	for _, o := range s.offsets {
 		if o.Err == "" && o.Offset >= 60000 {
-			s.pl("- The camera's own offset measurement (CC_READ_OFFSET) is near full scale -> the analog chain/A-D sees a saturated")
-			s.pl("  signal even without a readout of the image: points at output amplifier / bias voltages / A-D, not at USB or software.")
+			s.pl("- The camera's own offset measurement (CC_READ_OFFSET) is near full scale: the analog chain / A-D is saturated even")
+			s.pl("  without an image readout. So it is not a USB transfer problem; it is either a hardware fault (output amplifier,")
+			s.pl("  bias voltages, A-D) or A-D/clocking state left bad in the camera (only a power cycle resets that).")
 			break
 		}
 	}
