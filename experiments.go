@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -105,6 +106,15 @@ func (s *Session) FullTest() {
 	s.heading("DCP_VERT_FLUSH_CONTROL_ENABLE = 0", "Disables background vertical flushing of the KAI CCD during integration (SBIG test setting).")
 	s.withDCP(DCP_VERT_FLUSH_CONTROL_ENABLE, 0, func() { s.series("vflush0-bias", bias(0), 2) })
 
+	s.heading("DCP_AUTO_AD_GAIN = 0", "Stops the driver from re-writing the A/D gain register before each readout "+
+		"(the camera keeps its power-up A/D settings). Tests whether the driver's A/D writes are involved.")
+	s.withDCP(DCP_AUTO_AD_GAIN, 0, func() { s.series("autoadgain0-bias", bias(0), 2) })
+
+	if v, err := s.cam.GetDCP(DCP_PIXEL_PIPELINE_ENABLE); err == nil && v != 0 {
+		s.heading("DCP_PIXEL_PIPELINE_ENABLE = 0", "Disables the driver's pixel pipelining (data path test).")
+		s.withDCP(DCP_PIXEL_PIPELINE_ENABLE, 0, func() { s.series("pipeline0-bias", bias(0), 2) })
+	}
+
 	s.heading("DCP_OVERSCAN_ROWSCOLS = 1", "Adds overscan rows/columns (pixels that never held charge). If overscan is also saturated, "+
 		"the fault is in the output amplifier / analog chain / A-D, not charge on the CCD.")
 	s.withDCP(DCP_OVERSCAN_ROWSCOLS, 1, func() {
@@ -117,8 +127,16 @@ func (s *Session) FullTest() {
 	s.cam.CCDInfo(0) // refresh geometry after restore
 
 	// Any other parameter that differs from its documented default.
-	for i, def := range dcpDocDefault {
-		if i == DCP_USB_FIFO_SIZE || i == 2 || i == DCP_WARM_PIXEL_REPAIR_COUNT {
+	var keys []int
+	for i := range dcpDocDefault {
+		keys = append(keys, i)
+	}
+	sort.Ints(keys)
+	for _, i := range keys {
+		def := dcpDocDefault[i]
+		// Not toggled: sizes/ratios, and the repair settings that the driver persists in the registry.
+		if i == DCP_USB_FIFO_SIZE || i == 2 || i == DCP_WARM_PIXEL_REPAIR_COUNT || i == DCP_COLUMN_REPAIR_ENABLE ||
+			i == DCP_WARM_PIXEL_REPAIR_ENABLE || i == DCP_CALL_JOURNAL_ENABLE || i == DCP_TDI_MODE_ENABLE {
 			continue
 		}
 		start, ok := s.dcpStart[i]
@@ -182,6 +200,15 @@ func (s *Session) FullTest() {
 	} else {
 		s.series("after-relink", bias(0), 2)
 	}
+
+	s.heading("re-link with DCP_AUTO_AD_GAIN = 0", "Re-initialise the connection while the driver does not touch the A/D gain.")
+	s.withDCP(DCP_AUTO_AD_GAIN, 0, func() {
+		if err := s.Relink(); err != nil {
+			s.pf("  re-link failed: %v\n", err)
+			return
+		}
+		s.series("relink-autoadgain0", bias(0), 2)
+	})
 
 	s.heading(fmt.Sprintf("rest %d s", s.restSec), "Leave the camera idle, then one frame. Does the fault decay with time (thermal/charge)?")
 	s.SampleOffsets("before rest", 2)
@@ -294,6 +321,9 @@ func (s *Session) Interpret() {
 	cmp("vddoff-dark5", "vddNormallyOff=1 fixes 5 s darks")
 	cmp("custoverscan-bias", "the overscan-option frame is fine")
 	cmp("slow-readout", "slower readout fixes it (timing / power-supply droop during fast readout?)")
+	cmp("autoadgain0-bias", "with DCP_AUTO_AD_GAIN=0 the frames are good: the driver's A/D gain writes are involved")
+	cmp("pipeline0-bias", "disabling the pixel pipeline fixes it")
+	cmp("relink-autoadgain0", "re-link with auto A/D gain off clears the fault")
 	cmp("after-relink", "a software re-link clears the fault (camera state problem; reconnecting before each frame is a workaround)")
 	cmp("after-rest", "resting idle clears the fault (thermal or slowly-recovering supply?)")
 	for _, exp := range order {
