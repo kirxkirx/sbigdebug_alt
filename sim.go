@@ -170,6 +170,21 @@ func (s *simTransport) Call(cmd uint16, p, r []byte) uint16 {
 		s.h, s.w = L.U16(p, "height"), L.U16(p, "width")
 		s.exposing = true
 		return 0
+	case CC_QUERY_COMMAND_STATUS2:
+		st, info := uint16(CS_IDLE), uint16(0)
+		if s.exposing {
+			st, info = CS_INTEGRATING, 2
+			el := time.Since(s.expStart)
+			if el < 50*time.Millisecond {
+				info = 1 // pre-exposure (shutter)
+			}
+			if el >= time.Duration(max(18, int(s.expTicks)))*10*time.Millisecond {
+				st, info = CS_INTEGRATION_COMPLETE, 3
+			}
+		}
+		L_QueryCommandStatusResults2.Put16(r, "status", st)
+		L_QueryCommandStatusResults2.Put16(r, "info", info)
+		return 0
 	case CC_QUERY_COMMAND_STATUS:
 		st := uint16(CS_IDLE)
 		if s.exposing {
@@ -185,6 +200,7 @@ func (s *simTransport) Call(cmd uint16, p, r []byte) uint16 {
 		return 0
 	case CC_START_READOUT:
 		s.line = 0
+		s.reading = true
 		return 0
 	case CC_READOUT_LINE:
 		n := int(L_ReadoutLineParams.U16(p, "pixelLength"))
@@ -197,7 +213,10 @@ func (s *simTransport) Call(cmd uint16, p, r []byte) uint16 {
 		s.line++
 		return 0
 	case CC_END_READOUT:
-		s.frames++
+		if s.reading {
+			s.frames++
+		}
+		s.reading = false
 		return 0
 	case CC_DUMP_LINES:
 		return 0

@@ -189,6 +189,13 @@ func (s *Session) FullTest() {
 		s.RestoreAll()
 	}
 
+	s.heading("shutter never moves", "One normal dark (closes the shutter), then 2 frames with SC_LEAVE_SHUTTER: the shutter motor "+
+		"is not powered at all. Tests whether the shutter's current pulse (supply sag) or its timing matters.")
+	s.series("shutter-close", bias(0), 1)
+	leave := bias(0)
+	leave.Leave = true
+	s.series("shutter-leave", leave, 2)
+
 	s.heading("slow readout", "2 ms pause after every line (readout ~5 s longer). Tests whether the failure depends on readout timing.")
 	slow := bias(0)
 	slow.LineDelay = 2 * time.Millisecond
@@ -269,10 +276,38 @@ func (s *Session) Interpret() {
 	switch {
 	case nb == 0:
 		s.pl("- The baseline bias frames are all fine: the fault did NOT reproduce in this run.")
+		s.pl("  sbigdiag calls the driver strictly one call at a time. NINA 3.2's native SBIG driver does NOT: it can run a")
+		s.pl("  temperature query while a frame is being read out (fixed in NINA 3.3 nightly: \"Fixed missing synchronization in")
+		s.pl("  native ... SBIG ... SDK calls\", commit f475c75d9f). If the camera now stays good here but fails in NINA 3.2,")
+		s.pl("  update NINA to 3.3 (nightly) or use the SBIG ASCOM driver in NINA.")
 	case !bad(base[0]) && nb > 0:
 		s.pl("- First baseline frame fine, later ones bad: the fault develops after the first readout (as reported).")
 	default:
 		s.pf("- %d of %d baseline bias frames are bad (first frame: %s).\n", nb, len(base), base[0].Class)
+		s.pl("  If the camera was NOT power-cycled since NINA last used it, it may still be in a state NINA left it in")
+		s.pl("  (NINA 3.2 can call the SBIG driver from two threads at once during readout; fixed in NINA 3.3 nightly).")
+		s.pl("  Decisive test: close NINA, power-cycle the camera, then run sbigdiag FIRST (option 3) before NINA connects.")
+	}
+	for _, r := range base {
+		if r.Exact65535 {
+			s.pl("- Frames are EXACTLY 65535 everywhere: a DL forum case with this signature was a USB hub problem (connect the")
+			s.pl("  camera directly to the PC / try another cable and port).")
+			break
+		}
+	}
+	if co, ok := s.info["customer_options"].(string); ok && strings.Contains(co, "preflashCcd=1") {
+		s.pl("- IR RBI PREFLASH IS ON in the camera. Diffraction Limited's first advice for 65535 bias/dark frames on STX/STXL is")
+		s.pl("  to turn the IR preflash OFF (CCDOps: Camera Setup -> Customer Options), and to keep driver and camera firmware")
+		s.pl("  versions matched (Driver Checker 64) - RBI preflash 'gets borked' when they are not updated together.")
+	}
+	var pre []string
+	for _, r := range base {
+		if r.PreExpS > 0.5 {
+			pre = append(pre, fmt.Sprintf("frame %d %.1fs", r.N, r.PreExpS))
+		}
+	}
+	if len(pre) > 0 {
+		s.pl("- Long pre-exposure phase (RBI preflash or slow shutter): " + strings.Join(pre, ", "))
 	}
 	if med := base[0].Stats.Median; base[0].Class != "ERROR" && (med < 300 || med > 3000) {
 		s.pf("- First baseline frame median %.0f ADU is far from the factory black level (~900-1000 ADU).\n", med)
@@ -320,6 +355,7 @@ func (s *Session) Interpret() {
 	cmp("vddoff-bias", "switching Vdd off between frames (camera option vddNormallyOff=1) FIXES bias frames - a usable workaround (set it in CCDOps)")
 	cmp("vddoff-dark5", "vddNormallyOff=1 fixes 5 s darks")
 	cmp("custoverscan-bias", "the overscan-option frame is fine")
+	cmp("shutter-leave", "frames are good when the shutter does not move (shutter motor current / timing involved)")
 	cmp("slow-readout", "slower readout fixes it (timing / power-supply droop during fast readout?)")
 	cmp("autoadgain0-bias", "with DCP_AUTO_AD_GAIN=0 the frames are good: the driver's A/D gain writes are involved")
 	cmp("pipeline0-bias", "disabling the pixel pipeline fixes it")

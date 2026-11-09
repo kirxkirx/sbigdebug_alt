@@ -63,6 +63,8 @@ type FrameResult struct {
 	RowMedian   []float64         `json:"row_median_binned"`
 	Errors      []string          `json:"errors"`
 	File        string            `json:"file"`
+	PreExpS     float64           `json:"pre_exposure_s"`
+	Exact65535  bool              `json:"all_exactly_65535"`
 }
 
 type OffsetSample struct {
@@ -119,6 +121,8 @@ func (s *Session) Connect() error {
 		return fmt.Errorf("CC_ESTABLISH_LINK: %v", err)
 	}
 	s.pf("Link established in %.1f s: camera type %s (%d)\n", time.Since(t0).Seconds(), cameraTypeName(typ), typ)
+	e1, e2 := c.CleanState()
+	s.pf("Clean-state preamble (abort any exposure/readout left by another program): end-exposure %s, end-readout %s\n", e1, e2)
 	return nil
 }
 
@@ -183,14 +187,12 @@ func (s *Session) Info() {
 	} else {
 		s.pf("Customer options: %v\n", err)
 	}
-	// Only query the RBI parameters when preflash is enabled (the vendor header's
-	// comments for the GET/SET RBI commands are contradictory; avoid it otherwise).
-	if o, err := c.GetCustomerOptions(); err == nil && o.Preflash != 0 {
-		if dl, fc, err := c.RBIParams(); err == nil {
-			s.pf("RBI preflash parameters: darkFrameLength=%d flushCount=%d\n", dl, fc)
-		} else {
-			s.pf("RBI preflash parameters: %v\n", err)
-		}
+	// GET only fills the results struct (params NULL) - it cannot write anything.
+	if dl, fc, err := c.RBIParams(); err == nil {
+		s.pf("RBI preflash parameters: darkFrameLength=%d flushCount=%d\n", dl, fc)
+		s.info["rbi"] = fmt.Sprintf("darkFrameLength=%d flushCount=%d", dl, fc)
+	} else {
+		s.pf("RBI preflash parameters: %v\n", err)
 	}
 	if cols, flags, err := c.ColumnEEPROM(); err == nil {
 		s.pf("Column-repair EEPROM: columns=%v flags=0x%04x\n", cols, flags)
@@ -202,6 +204,13 @@ func (s *Session) Info() {
 	}
 	t := c.Temperature()
 	s.pf("Temperature: %s\n", t)
+	s.info["temperature"] = t.String()
+	if t.Valid && t.Advanced && t.CoolingEnabled&1 != 0 && t.CoolerPower < 0.5 && t.CCDTemp > t.Setpoint+1 {
+		s.pl("  !!! Cooling is ENABLED but the cooler gets 0% power while the CCD is above the setpoint.")
+		s.pl("      The STXL switches its TE cooler off when the input voltage is <= 10.25 V (manual). Check the 12 V supply,")
+		s.pl("      cable and the voltage LEDs on the side of the camera (green / 11V / 10V / 9V) - 9V lit = unreliable operation.")
+		s.info["cooler_shutdown_suspected"] = true
+	}
 	if pl, err := c.PowerLow(); err == nil {
 		s.pf("Power-supply-low bit (input < ~10 V on STL; may not be wired on STXL): %v\n", pl)
 	} else {
@@ -393,6 +402,12 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 		IntegrS: f.IntegrDone.Seconds(), ReadoutS: f.ReadoutTime.Seconds(), Errors: f.Errors,
 		CCDTempC: f.TempAfter.CCDTemp, HeatsinkC: f.TempAfter.HeatsinkTemp, PowerLow: f.PowerLowAfter}
 	r.ComFailed = int64(f.LinkAfter.ComFailed) - int64(f.LinkBefore.ComFailed)
+	r.Exact65535 = a.Stats.Full65535Frac > 0.999
+	phases := ""
+	if f.PhasesValid {
+		r.PreExpS = f.Phases[1].Seconds()
+		phases = fmt.Sprintf("   phases: pre-exposure %.2f s, integrating %.2f s, post %.2f s", f.Phases[1].Seconds(), f.Phases[2].Seconds(), f.Phases[3].Seconds())
+	}
 	r.RowMedian = binProfile(a.RowMedian, 64)
 	r.SlowLines = slowLines(f.LineTimes)
 	// DCP snapshot for the record
@@ -404,6 +419,9 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 	}
 	s.pf("  => %s   integration %.2f s, readout %.2f s, CCD %.1f C, heatsink %.1f C, comFailed +%d, PS-low %s\n",
 		a.Class, r.IntegrS, r.ReadoutS, r.CCDTempC, r.HeatsinkC, r.ComFailed, r.PowerLow)
+	if phases != "" {
+		s.pl(phases)
+	}
 	for _, l := range a.Summary() {
 		s.pl("  " + l)
 	}

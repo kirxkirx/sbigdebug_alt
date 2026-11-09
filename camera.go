@@ -48,6 +48,7 @@ type Camera struct {
 	linked     bool
 	CameraType uint16
 	Info       *CCDInfo
+	noStatus2  bool
 }
 
 func NewCamera(t transport, trace io.Writer) *Camera { return &Camera{t: t, trace: trace} }
@@ -136,7 +137,14 @@ func (c *Camera) OpenDevice(device, ip string) error {
 func (c *Camera) EstablishLink() (uint16, error) {
 	p := L_EstablishLinkParams.New()
 	r := L_EstablishLinkResults.New()
-	if err := c.cmd(CC_ESTABLISH_LINK, p, r); err != nil {
+	var err error
+	for try := 0; try < 3; try++ { // SBIG samples note that Establish Link sometimes needs a retry
+		if err = c.cmd(CC_ESTABLISH_LINK, p, r); err == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if err != nil {
 		return 0, err
 	}
 	c.linked = true
@@ -551,6 +559,7 @@ type ExposureSpec struct {
 	CCDFlags  uint16        // START_SKIP_VDD etc. OR-ed into the ccd field
 	ExpFlags  uint32        // EXP_* OR-ed into exposureTime
 	LineDelay time.Duration // optional pause between ReadoutLine calls (timing test)
+	Leave     bool          // SC_LEAVE_SHUTTER: the shutter does not move at all
 }
 
 func (s ExposureSpec) Describe() string {
@@ -570,6 +579,9 @@ func (s ExposureSpec) Describe() string {
 	}
 	if s.LineDelay > 0 {
 		extra += fmt.Sprintf(" linedelay=%v", s.LineDelay)
+	}
+	if s.Leave {
+		extra += " shutter-not-moved"
 	}
 	sub := "full"
 	if s.Width > 0 || s.Height > 0 || s.Top > 0 || s.Left > 0 {
@@ -593,6 +605,8 @@ type Frame struct {
 	PowerLowAfter string
 	Errors        []string
 	DCPs          map[string]uint32
+	Phases        [4]time.Duration // time seen in XES_IDLE, PRE_EXP (RBI preflash / shutter), INTEGRATING, POST_EXP
+	PhasesValid   bool
 }
 
 var errAborted = errors.New("aborted by user")
@@ -635,6 +649,9 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	if s.Dark {
 		sh = SC_CLOSE_SHUTTER
 	}
+	if s.Leave {
+		sh = SC_LEAVE_SHUTTER
+	}
 	L.Put16(p, "openShutter", sh)
 	L.Put16(p, "readoutMode", s.Mode)
 	L.Put16(p, "top", uint16(s.Top))
@@ -645,26 +662,44 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	if err := c.cmd(CC_START_EXPOSURE2, p, nil); err != nil {
 		return nil, err
 	}
-	// Poll for the end of integration.
+	// Poll for the end of integration. CC_QUERY_COMMAND_STATUS2 also reports the
+	// exposure phase (pre-exposure = RBI preflash / shutter motion, integrating, post).
 	q := L_QueryCommandStatusParams.New()
 	L_QueryCommandStatusParams.Put16(q, "command", CC_START_EXPOSURE2)
-	qr := L_QueryCommandStatusResults.New()
+	qr := L_QueryCommandStatusResults2.New()
 	deadline := f.Start.Add(time.Duration(s.Seconds*float64(time.Second)) + 90*time.Second)
+	last := time.Now()
 	for {
 		if abort != nil && abort() {
 			c.endExposure(ABORT_DONT_END)
 			return nil, errAborted
 		}
-		if err := c.cmd(CC_QUERY_COMMAND_STATUS, q, qr); err != nil {
-			c.endExposure(ABORT_DONT_END)
-			return nil, err
+		var status uint16
+		if !c.noStatus2 {
+			if err := c.cmd(CC_QUERY_COMMAND_STATUS2, q, qr); err != nil {
+				c.noStatus2 = true // older driver/firmware: fall back below
+			} else {
+				status = L_QueryCommandStatusResults2.U16(qr, "status")
+				now := time.Now()
+				f.Phases[L_QueryCommandStatusResults2.U16(qr, "info")&3] += now.Sub(last)
+				f.PhasesValid = true
+				last = now
+			}
 		}
-		if L_QueryCommandStatusResults.U16(qr, "status")&3 == CS_INTEGRATION_COMPLETE {
+		if c.noStatus2 {
+			r1 := L_QueryCommandStatusResults.New()
+			if err := c.cmd(CC_QUERY_COMMAND_STATUS, q, r1); err != nil {
+				c.endExposure(ABORT_DONT_END)
+				return nil, err
+			}
+			status = L_QueryCommandStatusResults.U16(r1, "status")
+		}
+		if status&3 == CS_INTEGRATION_COMPLETE {
 			break
 		}
 		if time.Now().After(deadline) {
 			c.endExposure(ABORT_DONT_END)
-			return nil, fmt.Errorf("timeout waiting for integration to complete (status=0x%04x)", L_QueryCommandStatusResults.U16(qr, "status"))
+			return nil, fmt.Errorf("timeout waiting for integration to complete (status=0x%04x)", status)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -729,6 +764,20 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 		return f, readErr
 	}
 	return f, nil
+}
+
+// CleanState aborts any exposure/readout a previous program may have left behind.
+func (c *Camera) CleanState() (string, string) {
+	e1 := c.endExposure(ABORT_DONT_END)
+	p := L_EndReadoutParams.New()
+	e2 := c.cmd(CC_END_READOUT, p, nil)
+	s := func(e error) string {
+		if e == nil {
+			return "ok"
+		}
+		return shortErr(e)
+	}
+	return s(e1), s(e2)
 }
 
 func (c *Camera) endExposure(flags uint16) error {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -22,13 +23,83 @@ type dllTransport struct {
 	path string
 }
 
+// processArch is the PE machine string our own process needs.
+func processArch() string {
+	if runtime.GOARCH == "386" {
+		return "32-bit (x86)"
+	}
+	return "64-bit (x64)"
+}
+
+// loadDriverDLL loads an explicit -dll path, or picks the first SBIGUDrv.dll of the
+// right bitness: for the 64-bit exe NINA's bundled copy (the very DLL NINA uses) and
+// then System32; for the 32-bit exe the system copy that CCDOps uses. Loading by bare
+// name is only the last resort: Windows may find the 32-bit copy in C:\Windows\System
+// first and fail with "not a valid Win32 application" in a 64-bit process.
 func loadDriverDLL(path string) (transport, error) {
-	if path == "" {
-		path = "SBIGUDrv.dll"
+	if path != "" {
+		return loadOneDLL(path)
+	}
+	want := processArch()
+	var tried []string
+	for _, p := range preferredDLLs() {
+		if m := peMachine(p); m != want {
+			continue
+		}
+		t, err := loadOneDLL(p)
+		if err == nil {
+			return t, nil
+		}
+		tried = append(tried, err.Error())
+	}
+	t, err := loadOneDLL("SBIGUDrv.dll")
+	if err == nil {
+		return t, nil
+	}
+	tried = append(tried, err.Error())
+	return nil, fmt.Errorf("no usable %s SBIGUDrv.dll:\n  %s\n  The 64-bit exe needs a 64-bit DLL (NINA's External\\x64\\SBIG copy or System32),\n  the 32-bit exe the 32-bit DLL that CCDOps uses. Try the other exe, or -dll <path>.",
+		want, strings.Join(tried, "\n  "))
+}
+
+func preferredDLLs() []string {
+	all := candidateDLLs()
+	rank := func(p string) int {
+		l := strings.ToLower(p)
+		switch {
+		case strings.Contains(l, `n.i.n.a`) && runtime.GOARCH != "386":
+			return 0
+		case strings.Contains(l, `\system32\`) || strings.Contains(l, `\sysnative\`):
+			return 1
+		case strings.HasSuffix(filepath.Dir(l), `\system`):
+			return 2
+		case strings.Contains(l, `\syswow64\`):
+			return 3
+		}
+		return 4
+	}
+	sort.SliceStable(all, func(i, j int) bool { return rank(all[i]) < rank(all[j]) })
+	return all
+}
+
+var procSetDllDirectoryW = modKernel32.NewProc("SetDllDirectoryW")
+
+func loadOneDLL(path string) (transport, error) {
+	if strings.ContainsAny(path, `\/`) {
+		// Let the DLL find vcruntime140.dll: next to it, or in NINA's install root.
+		dir := filepath.Dir(path)
+		for d, k := dir, 0; k < 5; d, k = filepath.Dir(d), k+1 {
+			if _, err := os.Stat(filepath.Join(d, "vcruntime140.dll")); err == nil {
+				dir = d
+				break
+			}
+		}
+		if p16, err := syscall.UTF16PtrFromString(dir); err == nil {
+			procSetDllDirectoryW.Call(uintptr(unsafe.Pointer(p16)))
+		}
 	}
 	d, err := syscall.LoadDLL(path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot load %s: %v (is the SBIG driver installed? 64-bit exe needs the 64-bit DLL, 32-bit exe the 32-bit DLL; try the other exe or -dll <path>)", path, err)
+		return nil, fmt.Errorf("cannot load %s: %v", path, err)
 	}
 	p, err := d.FindProc("SBIGUnivDrvCommand")
 	if err != nil {
@@ -142,6 +213,7 @@ func candidateDLLs() []string {
 	// A 32-bit process sees SysWOW64 as System32; Sysnative reveals the real 64-bit System32.
 	add(filepath.Join(win, "Sysnative", "SBIGUDrv.dll"))
 	add(filepath.Join(win, "System32", "SBIGUDrv.dll"))
+	add(filepath.Join(win, "System", "SBIGUDrv.dll")) // where Driver Checker puts the 32-bit DLL
 	add(filepath.Join(win, "SysWOW64", "SBIGUDrv.dll"))
 	for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"} {
 		root := os.Getenv(env)
