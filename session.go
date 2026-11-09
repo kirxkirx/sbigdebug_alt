@@ -272,7 +272,7 @@ func (s *Session) SampleOffsets(label string, n int) {
 				vals = append(vals, "err "+shortErr(err))
 				break
 			}
-			smp.Offset, smp.RMS = int(o2), math.NaN()
+			smp.Offset, smp.RMS = int(o2), -1 // RMS unknown with CC_READ_OFFSET
 		}
 		s.offsets = append(s.offsets, smp)
 		vals = append(vals, fmt.Sprintf("%d (rms %.1f)", smp.Offset, smp.RMS))
@@ -563,15 +563,43 @@ func (s *Session) PrintTable() {
 	}
 }
 
+// finite replaces NaN/Inf (which encoding/json refuses) with -1.
+func finite(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return -1
+	}
+	return v
+}
+
 func (s *Session) WriteJSON() {
 	if s.dir == "" {
 		return
 	}
+	for _, r := range s.results {
+		r.TopMed, r.BottomMed, r.LeftMed, r.RightMed = finite(r.TopMed), finite(r.BottomMed), finite(r.LeftMed), finite(r.RightMed)
+		r.IntegrS, r.ReadoutS, r.CCDTempC, r.HeatsinkC = finite(r.IntegrS), finite(r.ReadoutS), finite(r.CCDTempC), finite(r.HeatsinkC)
+		for i := range r.RowMedian {
+			r.RowMedian[i] = finite(r.RowMedian[i])
+		}
+		for i := range r.Boundaries {
+			r.Boundaries[i].Before, r.Boundaries[i].After = finite(r.Boundaries[i].Before), finite(r.Boundaries[i].After)
+		}
+		for i := range r.Segments {
+			r.Segments[i].Median, r.Segments[i].SatFrac = finite(r.Segments[i].Median), finite(r.Segments[i].SatFrac)
+		}
+	}
+	for i := range s.offsets {
+		s.offsets[i].RMS = finite(s.offsets[i].RMS)
+	}
 	doc := map[string]interface{}{
 		"version": version, "info": s.info, "frames": s.results, "offsets": s.offsets,
 	}
-	b, _ := json.MarshalIndent(doc, "", " ")
-	_ = os.WriteFile(filepath.Join(s.dir, "summary.json"), b, 0o644)
+	b, err := json.MarshalIndent(doc, "", " ")
+	if err != nil {
+		fmt.Fprintf(s.out, "summary.json not written: %v\n", err)
+	} else {
+		_ = os.WriteFile(filepath.Join(s.dir, "summary.json"), b, 0o644)
+	}
 	// One-line-per-frame CSV for spreadsheets.
 	f, err := os.Create(filepath.Join(s.dir, "frames.csv"))
 	if err != nil {
