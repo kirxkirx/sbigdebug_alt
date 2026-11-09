@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -41,23 +42,20 @@ func loadDriverDLL(path string) (transport, error) {
 	return t, nil
 }
 
-func ptr(b []byte) uintptr {
-	if len(b) == 0 {
-		return 0
-	}
-	return uintptr(unsafe.Pointer(&b[0]))
-}
-
 func (t *dllTransport) Call(cmd uint16, params, results []byte) uint16 {
-	var pp, rp uintptr
+	var p, r unsafe.Pointer
 	if len(params) > 0 {
-		pp = uintptr(unsafe.Pointer(&params[0]))
+		p = unsafe.Pointer(&params[0])
 	}
 	if len(results) > 0 {
-		rp = uintptr(unsafe.Pointer(&results[0]))
+		r = unsafe.Pointer(&results[0])
 	}
-	r, _, _ := syscall.SyscallN(t.proc.Addr(), uintptr(cmd), pp, rp)
-	return uint16(r)
+	// Pointer->uintptr conversions inline in the call (unsafe.Pointer rule 4), and keep
+	// both buffers alive until the driver has returned.
+	ret, _, _ := syscall.SyscallN(t.proc.Addr(), uintptr(cmd), uintptr(p), uintptr(r))
+	runtime.KeepAlive(params)
+	runtime.KeepAlive(results)
+	return uint16(ret) // C 'short' return value: only the low 16 bits are defined
 }
 
 func (t *dllTransport) Close() error { return t.dll.Release() }
