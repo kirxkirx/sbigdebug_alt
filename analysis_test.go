@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -91,5 +92,28 @@ func TestParseCustom(t *testing.T) {
 	s, err := parseCustom("exp=5,bin=2,dark=0,top=10,height=20,skipvdd=1,linedelay=2ms")
 	if err != nil || s.Seconds != 5 || s.Mode != 1 || s.Dark || s.Top != 10 || s.Height != 20 || s.CCDFlags != START_SKIP_VDD || s.LineDelay.Milliseconds() != 2 {
 		t.Errorf("%+v %v", s, err)
+	}
+}
+
+func TestXISFRead(t *testing.T) {
+	w, h := 5, 3
+	data := make([]byte, 2*w*h)
+	for i := 0; i < w*h; i++ {
+		data[2*i] = byte(i)
+		data[2*i+1] = 0x10
+	}
+	xml := `<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0"><Image geometry="5:3:1" sampleFormat="UInt16" colorSpace="Gray" location="attachment:4096:30"><FITSKeyword name="EXPTIME" value="0.01" comment=""/></Image></xisf>`
+	buf := make([]byte, 4096+len(data))
+	copy(buf, "XISF0100")
+	le.PutUint32(buf[8:], uint32(len(xml)))
+	copy(buf[16:], xml)
+	copy(buf[4096:], data)
+	fn := filepath.Join(t.TempDir(), "t.xisf")
+	if err := os.WriteFile(fn, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, gw, gh, hdr, err := ReadImage(fn)
+	if err != nil || gw != 5 || gh != 3 || p[7] != 0x1007 || hdr["EXPTIME"] != "0.01" {
+		t.Fatalf("%v %d %d %x %v", err, gw, gh, p, hdr)
 	}
 }

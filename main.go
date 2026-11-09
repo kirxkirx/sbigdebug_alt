@@ -88,7 +88,7 @@ Close NINA / CCDOps / MaxIm (or disconnect the camera in them) before using opti
   2) Quick test: information + 5 bias frames with analysis           ~ 2 min
   3) FULL diagnostic: information + all experiments (recommended)    ~ 10 min
   4) Custom series (choose exposure, binning, subframe, settings)
-  5) Analyse existing FITS files (e.g. from NINA) - no camera needed
+  5) Analyse existing FITS/XISF files (e.g. from NINA) - no camera needed
   6) Demo with a simulated faulty camera (no hardware needed)
   q) Quit`)
 		fmt.Print("Choice [3]: ")
@@ -372,7 +372,7 @@ func analyzeFiles(paths []string, o options) int {
 			continue
 		}
 		if st.IsDir() {
-			for _, pat := range []string{"*.fits", "*.fit", "*.fts", "*.FITS", "*.FIT", "*.FTS"} {
+			for _, pat := range []string{"*.fits", "*.fit", "*.fts", "*.FITS", "*.FIT", "*.FTS", "*.xisf", "*.XISF"} {
 				m, _ := filepath.Glob(filepath.Join(p, pat))
 				files = append(files, m...)
 			}
@@ -381,12 +381,12 @@ func analyzeFiles(paths []string, o options) int {
 		}
 	}
 	if len(files) == 0 {
-		fmt.Println("no FITS files to analyse")
+		fmt.Println("no FITS/XISF files to analyse")
 		return 1
 	}
 	s := &Session{out: os.Stdout, info: map[string]interface{}{}}
 	for i, f := range files {
-		pix, w, h, hdr, err := ReadFITS(f)
+		pix, w, h, hdr, err := ReadImage(f)
 		if err != nil {
 			fmt.Printf("\n--- %s: %v\n", f, err)
 			continue
