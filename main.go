@@ -37,6 +37,7 @@ type options struct {
 	analyze                                             bool
 	rest                                                int
 	driverLog                                           bool
+	noEventLog                                          bool
 }
 
 func main() {
@@ -56,7 +57,8 @@ func main() {
 	flag.BoolVar(&o.noPause, "nopause", false, "do not wait for Enter before exiting")
 	flag.BoolVar(&o.noFITS, "nofits", false, "do not save FITS files (PNG previews and CSV are still written)")
 	flag.IntVar(&o.rest, "rest", 90, "idle time in seconds for the 'rest' experiment of -full")
-	flag.BoolVar(&o.driverLog, "driverlog", false, "also enable the SBIG driver's own debug log (sbigudrv_debug.log in the output folder)")
+	flag.BoolVar(&o.driverLog, "driverlog", false, "verbose SBIG driver debug log (commands + USB), not only camera events")
+	flag.BoolVar(&o.noEventLog, "noeventlog", false, "do not record the camera's event messages (e.g. 'LV TE Off') via the driver's debug log")
 	flag.BoolVar(&o.analyze, "analyze", false, "analyse FITS files given as arguments (also: drag & drop FITS files onto the exe)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "sbigdiag %s - SBIG STX/STXL camera diagnostics\n\nUsage: sbigdiag [options] [file.fits ...]\n", version)
@@ -262,6 +264,8 @@ func runCamera(o options) int {
 	_ = logf
 	fmt.Fprintf(out, "sbigdiag %s  started %s  output folder: %s\n", version, time.Now().Format("2006-01-02 15:04:05 MST"), dir)
 	sysInfo(out)
+	regSnap := snapshotSBIGRegistry()
+	eventLog := "" // SBIG driver debug log file (camera events), set once enabled
 
 	var t transport
 	var err error
@@ -305,16 +309,34 @@ func runCamera(o options) int {
 		} else {
 			fmt.Fprintln(out, "All changed settings are back to their original values.")
 		}
+		if eventLog != "" {
+			_ = cam.DebugLog(eventLog, 0, 0, 0, 0) // stop logging
+		}
 		cam.Shutdown()
+		for _, l := range restoreSBIGRegistry(regSnap) {
+			fmt.Fprintln(out, "registry: "+l)
+		}
+		if eventLog != "" {
+			summarizeEventLog(out, eventLog)
+		}
 		s.WriteJSON()
 		fmt.Fprintf(out, "Results saved in: %s\n", dir)
 	}()
 
-	if o.driverLog && dir != "" {
+	// The driver's debug log with DLF_FCE_CAMERA records the STX/STXL camera's own event
+	// messages, e.g. "LV TE Off" (input voltage too low, cooler switched off).
+	if (o.driverLog || !o.noEventLog) && dir != "" {
 		if err := cam.OpenDriver(); err == nil {
-			p, _ := filepath.Abs(filepath.Join(dir, "sbigudrv_debug.log"))
-			err = cam.DebugLog(p, 0x0F, 0x1F, 0x83, 0)
-			fmt.Fprintf(out, "SBIG driver debug log -> %s (%v)\n", p, err)
+			eventLog, _ = filepath.Abs(filepath.Join(dir, "sbigudrv_debug.log"))
+			if o.driverLog {
+				err = cam.DebugLog(eventLog, 0x0F, 0x1F, 0x83, 0)
+			} else {
+				err = cam.DebugLog(eventLog, 0, 0, 0x80, 0)
+			}
+			fmt.Fprintf(out, "SBIG driver debug log (camera events%s) -> %s (%v)\n", map[bool]string{true: " + commands", false: ""}[o.driverLog], eventLog, err)
+			if err != nil {
+				eventLog = ""
+			}
 		}
 	}
 	if err := s.Connect(); err != nil {
@@ -408,4 +430,36 @@ func analyzeFiles(paths []string, o options) int {
 	fmt.Println("\n" + levelLegend)
 	s.PrintTable()
 	return 0
+}
+
+// summarizeEventLog prints the camera events the SBIG driver logged.
+func summarizeEventLog(out io.Writer, path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(out, "SBIG driver debug log: not written (%v)\n", err)
+		return
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r", ""), "\n")
+	var hits []string
+	for _, l := range lines {
+		u := strings.ToUpper(l)
+		if strings.Contains(u, "LV ") || strings.Contains(u, "TE OFF") || strings.Contains(u, "EVENT") || strings.Contains(u, "ERROR") ||
+			strings.Contains(u, "FAIL") || strings.Contains(u, "VOLT") || strings.Contains(u, "TIMEOUT") {
+			hits = append(hits, strings.TrimSpace(l))
+		}
+	}
+	fmt.Fprintf(out, "SBIG driver debug log: %d lines, %d look like camera events/errors (%s)\n", len(lines), len(hits), path)
+	for i, h := range hits {
+		if i >= 25 {
+			fmt.Fprintf(out, "  ... %d more\n", len(hits)-25)
+			break
+		}
+		fmt.Fprintln(out, "  "+h)
+	}
+	for _, h := range hits {
+		if strings.Contains(strings.ToUpper(h), "LV") {
+			fmt.Fprintln(out, "  !!! The camera reported a LOW-VOLTAGE event: check the 12/13 V supply (>= 10 A), cable and connector.")
+			break
+		}
+	}
 }

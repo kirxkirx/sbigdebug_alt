@@ -225,3 +225,93 @@ func ownsConsole() bool {
 	n, _, _ := procGetConsoleProcessList.Call(uintptr(unsafe.Pointer(&ids[0])), 4)
 	return n == 1
 }
+
+// --- SBIG registry snapshot / restore (HKCU\Software\SBIG) ---
+
+var (
+	procRegSetValueExW = modAdvapi32.NewProc("RegSetValueExW")
+	procRegDeleteValue = modAdvapi32.NewProc("RegDeleteValueW")
+)
+
+type regVal struct {
+	typ  uint32
+	data []byte
+}
+
+// RegSnapshot records every value under HKCU\Software\SBIG (the SBIG driver keeps
+// its user settings there) so that anything the driver writes during our run can
+// be put back.
+type RegSnapshot map[string]regVal // key: subkey + "\x00" + value name
+
+func snapshotSBIGRegistry() RegSnapshot {
+	snap := RegSnapshot{}
+	var walk func(path string, depth int)
+	walk = func(path string, depth int) {
+		h, ok := regOpen(syscall.HKEY_CURRENT_USER, path)
+		if !ok {
+			return
+		}
+		for i := uint32(0); i < 500; i++ {
+			name := make([]uint16, 512)
+			nlen := uint32(len(name))
+			data := make([]byte, 8192)
+			dlen := uint32(len(data))
+			var typ uint32
+			r, _, _ := procRegEnumValueW.Call(uintptr(h), uintptr(i), uintptr(unsafe.Pointer(&name[0])), uintptr(unsafe.Pointer(&nlen)),
+				0, uintptr(unsafe.Pointer(&typ)), uintptr(unsafe.Pointer(&data[0])), uintptr(unsafe.Pointer(&dlen)))
+			if r != 0 {
+				break
+			}
+			snap[path+"\x00"+syscall.UTF16ToString(name[:nlen])] = regVal{typ, append([]byte(nil), data[:dlen]...)}
+		}
+		subs := regSubkeys(h)
+		syscall.RegCloseKey(h)
+		if depth > 0 {
+			for _, sk := range subs {
+				walk(path+`\`+sk, depth-1)
+			}
+		}
+	}
+	walk(`Software\SBIG`, 6)
+	return snap
+}
+
+// restoreSBIGRegistry undoes value changes made since 'before'. Returns a report.
+func restoreSBIGRegistry(before RegSnapshot) []string {
+	after := snapshotSBIGRegistry()
+	var out []string
+	for k, v := range after {
+		old, existed := before[k]
+		if existed && old.typ == v.typ && string(old.data) == string(v.data) {
+			continue
+		}
+		path, name, _ := strings.Cut(k, "\x00")
+		var h syscall.Handle
+		p, _ := syscall.UTF16PtrFromString(path)
+		if syscall.RegOpenKeyEx(syscall.HKEY_CURRENT_USER, p, 0, syscall.KEY_SET_VALUE|syscall.KEY_QUERY_VALUE, &h) != nil {
+			out = append(out, fmt.Sprintf("HKCU\\%s\\%s changed but cannot be opened for restore", path, name))
+			continue
+		}
+		n, _ := syscall.UTF16PtrFromString(name)
+		var r uintptr
+		if existed {
+			var dp uintptr
+			if len(old.data) > 0 {
+				dp = uintptr(unsafe.Pointer(&old.data[0]))
+			}
+			r, _, _ = procRegSetValueExW.Call(uintptr(h), uintptr(unsafe.Pointer(n)), 0, uintptr(old.typ), dp, uintptr(len(old.data)))
+			out = append(out, fmt.Sprintf("HKCU\\%s\\%s was changed during the run -> restored (rc=%d)", path, name, r))
+		} else {
+			r, _, _ = procRegDeleteValue.Call(uintptr(h), uintptr(unsafe.Pointer(n)))
+			out = append(out, fmt.Sprintf("HKCU\\%s\\%s was created during the run -> removed (rc=%d)", path, name, r))
+		}
+		syscall.RegCloseKey(h)
+	}
+	for k := range before {
+		if _, ok := after[k]; !ok {
+			path, name, _ := strings.Cut(k, "\x00")
+			out = append(out, fmt.Sprintf("HKCU\\%s\\%s disappeared during the run (not recreated)", path, name))
+		}
+	}
+	return out
+}

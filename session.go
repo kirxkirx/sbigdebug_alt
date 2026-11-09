@@ -132,7 +132,8 @@ func (s *Session) Info() {
 	c := s.cam
 	s.pl("\n== Camera ==")
 	if info, err := c.CCDInfo(0); err == nil {
-		s.pf("Name: %s\nFirmware: %s   camera type: %s\n", info.Name, info.FirmwareString(), cameraTypeName(info.CameraType))
+		s.pf("Name: %s\nFirmware: %s (BCD 0x%04x; NINA displays this as %d.%d because it prints the low byte in decimal)   camera type: %s\n",
+			info.Name, info.FirmwareString(), info.Firmware, info.Firmware>>8, info.Firmware&0xFF, cameraTypeName(info.CameraType))
 		s.info["camera"] = info.Name
 		s.info["firmware"] = info.FirmwareString()
 		for _, m := range info.Modes {

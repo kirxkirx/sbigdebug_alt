@@ -70,7 +70,7 @@ func (s *simTransport) Call(cmd uint16, p, r []byte) uint16 {
 		switch req {
 		case 0:
 			L := L_GetCCDInfoResults0
-			L.Put16(r, "firmwareVersion", 0x0284)
+			L.Put16(r, "firmwareVersion", 0x0254)
 			L.Put16(r, "cameraType", 17)
 			L.PutStr(r, "name", 64, "SBIG STXL-11002 3 CCD Camera (simulated)")
 			L.Put16(r, "readoutModes", 3)

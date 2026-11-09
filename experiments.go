@@ -74,6 +74,12 @@ func (s *Session) FullTest() {
 	s.heading("5 s dark", "Longer exposure: the driver lowers Vdd during exposures >= 3 s (DCP_VDD_OPTIMIZED).")
 	s.series("dark-5s", dark(5), 1)
 
+	s.heading("shutter OPEN (light) frames", "Same as the bias but with the shutter open (keep the telescope covered / dome dark). "+
+		"In the known STX/STXL RBI-preflash bug, light frames were normal while bias/dark frames were saturated.")
+	lt := bias(0)
+	lt.Dark = false
+	s.series("light-min", lt, 2)
+
 	s.heading("binning 2x2 and 3x3", "Different readout/clocking modes. If one still works there is a usable mode.")
 	s.series("bin2x2", bias(1), 2)
 	s.series("bin3x3", bias(2), 1)
@@ -343,6 +349,7 @@ func (s *Session) Interpret() {
 			s.pf("- %s: still bad\n", exp)
 		}
 	}
+	cmp("light-min", "shutter-open frames are fine while closed-shutter (bias/dark) frames are bad: the signature of the STX/STXL RBI-preflash / driver-firmware mismatch bug")
 	cmp("bin2x2", "binned readout works: a usable workaround mode and a clue to the clocking/readout path")
 	cmp("bin3x3", "3x3 binned readout works")
 	cmp("sub-top200", "top rows are fine")

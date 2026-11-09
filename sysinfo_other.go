@@ -14,3 +14,8 @@ func sysInfo(out io.Writer) {
 
 func disableQuickEdit() {}
 func ownsConsole() bool { return false }
+
+type RegSnapshot map[string]struct{}
+
+func snapshotSBIGRegistry() RegSnapshot               { return RegSnapshot{} }
+func restoreSBIGRegistry(before RegSnapshot) []string { return nil }
