@@ -1,0 +1,6 @@
+/sbigdiag
+*.exe
+/dist/
+/sbigdiag_*/
+/tools/abicheck/abi_check.c
+/tools/abicheck/sbigudrv.h

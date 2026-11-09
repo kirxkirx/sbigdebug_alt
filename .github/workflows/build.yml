@@ -1,0 +1,112 @@
+name: build
+
+# Every push / PR: unit tests, ABI check against the vendor header, Windows
+# cross-builds, and a smoke test of the real .exe on a Windows runner (simulated
+# camera). Pushing a tag v* additionally publishes a GitHub Release with the exes.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: gofmt / vet / unit tests
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=386 go vet ./...
+          go test -count=1 ./...
+      - name: ABI check (struct offsets vs. vendor sbigudrv.h, Win32 + Win64)
+        run: |
+          clang --version | head -1
+          ./tools/abicheck/check.sh
+      - name: Simulated full run on Linux
+        run: |
+          go build -o sbigdiag .
+          ./sbigdiag -simulate -full -rest 1 -nopause -nofits -out simrun | tail -60
+          test -s simrun/summary.json && test -s simrun/frames.csv && test -s simrun/report.txt
+          grep -q "All changed settings are back to their original values" simrun/report.txt
+      - name: Cross-compile Windows executables
+        run: |
+          V=$(git describe --tags --always --dirty)
+          mkdir -p dist
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$V" -o dist/sbigdiag-win64.exe .
+          GOOS=windows GOARCH=386   go build -trimpath -ldflags "-s -w -X main.version=$V" -o dist/sbigdiag-win32.exe .
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbigdiag-windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  windows-smoke:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbigdiag-windows
+          path: dist
+      - name: Smoke-test the exes on Windows (simulated camera, file analysis, missing driver)
+        shell: pwsh
+        run: |
+          foreach ($exe in "dist\sbigdiag-win64.exe", "dist\sbigdiag-win32.exe") {
+            Write-Host "=== $exe ==="
+            & $exe -simulate -quick -n 3 -nopause -out "smoke_$([IO.Path]::GetFileNameWithoutExtension($exe))" | Select-Object -Last 25
+            if ($LASTEXITCODE -ne 0) { throw "$exe -simulate failed: $LASTEXITCODE" }
+            $fits = Get-ChildItem "smoke_$([IO.Path]::GetFileNameWithoutExtension($exe))\*.fits" | Select-Object -First 1
+            & $exe -nopause $fits.FullName | Select-Object -Last 8
+            if ($LASTEXITCODE -ne 0) { throw "$exe file analysis failed" }
+            # Real driver path: no SBIG driver on the runner -> must fail cleanly (exit 2), not crash.
+            & $exe -info -nopause -dll "C:\nonexistent\SBIGUDrv.dll" | Select-Object -Last 5
+            if ($LASTEXITCODE -ne 2) { throw "$exe expected exit 2 without driver, got $LASTEXITCODE" }
+          }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, windows-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbigdiag-windows
+          path: dist
+      - name: Package
+        run: |
+          cd dist
+          cp ../README.md .
+          sha256sum *.exe > SHA256SUMS.txt
+          zip sbigdiag-windows.zip sbigdiag-win64.exe sbigdiag-win32.exe README.md SHA256SUMS.txt
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sbigdiag-win64.exe
+            dist/sbigdiag-win32.exe
+            dist/sbigdiag-windows.zip
+            dist/SHA256SUMS.txt
+          body: |
+            Windows diagnostic tool for SBIG STX/STXL cameras (SBIG Universal Driver).
+            **Download `sbigdiag-win64.exe`**, put it in a folder you can write to, close NINA/CCDOps (or disconnect the camera there),
+            and double-click it. Choose option 3 (full diagnostic, about 10 minutes). Results are saved in a `sbigdiag_<date>` folder
+            next to the exe; send that folder back for analysis.
+            Use `sbigdiag-win32.exe` only if the 64-bit one cannot load SBIGUDrv.dll.
+            Built and smoke-tested by GitHub Actions (simulated camera; the struct layouts are verified against the vendor header).

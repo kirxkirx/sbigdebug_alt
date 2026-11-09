@@ -1,0 +1,294 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+func bias(mode uint16) ExposureSpec { return ExposureSpec{Seconds: 0, Dark: true, Mode: mode} }
+func dark(sec float64) ExposureSpec { return ExposureSpec{Seconds: sec, Dark: true} }
+
+func bad(r *FrameResult) bool {
+	return r != nil && (r.Class == "SATURATED" || r.Class == "CORRUPT" || r.Class == "ERROR")
+}
+
+// series takes n frames of one spec and returns them.
+func (s *Session) series(exp string, spec ExposureSpec, n int) []*FrameResult {
+	var out []*FrameResult
+	for k := 0; k < n && !s.aborted(); k++ {
+		if r := s.TakeFrame(exp, spec); r != nil {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// withDCP runs fn with a driver control parameter temporarily changed, then restores it.
+func (s *Session) withDCP(i int, v uint32, fn func()) {
+	cur, err := s.cam.GetDCP(i)
+	if err != nil {
+		s.pf("  skipping: %s is not readable on this driver/camera (%s)\n", dcpNames[i], shortErr(err))
+		return
+	}
+	if cur == v {
+		s.pf("  note: %s is already %d - running the frames anyway for comparison\n", dcpNames[i], v)
+		fn()
+		return
+	}
+	if err := s.SetDCPTemp(i, v); err != nil {
+		s.pf("  could not set %s=%d: %v\n", dcpNames[i], v, err)
+		s.RestoreAll()
+		return
+	}
+	defer s.RestoreAll()
+	fn()
+}
+
+func (s *Session) heading(name, why string) {
+	s.pf("\n==== Experiment: %s ====\n", name)
+	if why != "" {
+		s.pl("  " + why)
+	}
+}
+
+// QuickTest reproduces the reported sequence: a handful of bias frames.
+func (s *Session) QuickTest(n int) {
+	s.heading("baseline bias series", "Repeats the failing sequence (0 s dark frames, 1x1, full frame).")
+	s.series("baseline-bias", bias(0), n)
+	s.SampleOffsets("after baseline", 3)
+}
+
+// FullTest is the default diagnostic plan. Every changed setting is restored
+// right after its experiment, and again at the end.
+func (s *Session) FullTest() {
+	t0 := time.Now()
+	s.QuickTest(4)
+	if s.aborted() {
+		return
+	}
+	s.heading("5 s dark", "Longer exposure: the driver lowers Vdd during exposures >= 3 s (DCP_VDD_OPTIMIZED).")
+	s.series("dark-5s", dark(5), 1)
+
+	s.heading("binning 2x2 and 3x3", "Different readout/clocking modes. If one still works there is a usable mode.")
+	s.series("bin2x2", bias(1), 2)
+	s.series("bin3x3", bias(2), 1)
+
+	if m, ok := s.cam.Info.Mode(0); ok && m.Height > 400 {
+		s.heading("subframes", "Top vs bottom 200 rows: is the damage tied to the CCD position or to the readout order/time?")
+		top := bias(0)
+		top.Height = 200
+		s.series("sub-top200", top, 2)
+		bot := bias(0)
+		bot.Top = m.Height - 200
+		bot.Height = 200
+		s.series("sub-bottom200", bot, 2)
+	}
+
+	s.heading("DCP_VDD_OPTIMIZED = 0", "Vdd (output amplifier supply) is then lowered/raised for every exposure, not only >= 3 s.")
+	s.withDCP(DCP_VDD_OPTIMIZED, 0, func() {
+		s.series("vddopt0-bias", bias(0), 2)
+		s.series("vddopt0-dark5", dark(5), 1)
+	})
+
+	s.heading("START_SKIP_VDD", "Keeps Vdd ON during the integration (no lowering at all) for a 5 s dark.")
+	skip := dark(5)
+	skip.CCDFlags = START_SKIP_VDD
+	s.series("skipvdd-dark5", skip, 1)
+
+	s.heading("DCP_USB_FIFO_ENABLE = 0", "Disables the camera FIFO/pipelining: pixels are digitized only when each line is requested.")
+	s.withDCP(DCP_USB_FIFO_ENABLE, 0, func() { s.series("fifo0-bias", bias(0), 2) })
+
+	s.heading("DCP_VERT_FLUSH_CONTROL_ENABLE = 0", "Disables background vertical flushing of the KAI CCD during integration (SBIG test setting).")
+	s.withDCP(DCP_VERT_FLUSH_CONTROL_ENABLE, 0, func() { s.series("vflush0-bias", bias(0), 2) })
+
+	s.heading("DCP_OVERSCAN_ROWSCOLS = 1", "Adds overscan rows/columns (pixels that never held charge). If overscan is also saturated, "+
+		"the fault is in the output amplifier / analog chain / A-D, not charge on the CCD.")
+	s.withDCP(DCP_OVERSCAN_ROWSCOLS, 1, func() {
+		old := s.cam.Info
+		if info, err := s.cam.CCDInfo(0); err == nil && len(info.Modes) > 0 {
+			s.pf("  frame size with overscan: %dx%d (normal %dx%d)\n", info.Modes[0].Width, info.Modes[0].Height, old.Modes[0].Width, old.Modes[0].Height)
+		}
+		s.series("overscan-bias", bias(0), 1)
+	})
+	s.cam.CCDInfo(0) // refresh geometry after restore
+
+	// Any other parameter that differs from its documented default.
+	for i, def := range dcpDocDefault {
+		if i == DCP_USB_FIFO_SIZE || i == 2 || i == DCP_WARM_PIXEL_REPAIR_COUNT {
+			continue
+		}
+		start, ok := s.dcpStart[i]
+		if !ok || int64(start) == def {
+			continue
+		}
+		s.heading(fmt.Sprintf("%s back to documented default %d", dcpNames[i], def), "This parameter was not at its documented default when we connected.")
+		ii, dd := i, def
+		s.withDCP(ii, uint32(dd), func() { s.series(fmt.Sprintf("default-%s", strings.TrimPrefix(dcpNames[ii], "DCP_")), bias(0), 2) })
+	}
+
+	if o, err := s.cam.GetCustomerOptions(); err == nil && (o.Preflash != 0 || o.VddNormallyOff != 0) {
+		s.heading("camera customer options to factory defaults", "preflashCcd/vddNormallyOff are set in the camera; test with them off (restored afterwards).")
+		n := o
+		n.Preflash, n.VddNormallyOff = 0, 0
+		if err := s.SetOptionsTemp(n); err != nil {
+			s.pf("  could not change customer options: %v\n", err)
+		} else {
+			s.series("custopt-default-bias", bias(0), 2)
+		}
+		s.RestoreAll()
+	}
+
+	s.heading("slow readout", "2 ms pause after every line (readout ~5 s longer). Tests whether the failure depends on readout timing.")
+	slow := bias(0)
+	slow.LineDelay = 2 * time.Millisecond
+	s.series("slow-readout", slow, 1)
+
+	s.heading("re-link", "Close and reopen the camera connection (software re-initialisation, no power cycle).")
+	if err := s.Relink(); err != nil {
+		s.pf("  re-link failed: %v\n", err)
+	} else {
+		s.series("after-relink", bias(0), 2)
+	}
+
+	s.heading(fmt.Sprintf("rest %d s", s.restSec), "Leave the camera idle, then one frame. Does the fault decay with time (thermal/charge)?")
+	s.SampleOffsets("before rest", 2)
+	for k := 0; k < s.restSec && !s.aborted(); k++ {
+		time.Sleep(time.Second)
+	}
+	s.SampleOffsets("after rest", 2)
+	s.series("after-rest", bias(0), 1)
+
+	s.heading("final baseline", "All settings restored; repeat the baseline.")
+	s.RestoreAll()
+	s.DumpDCPs("Driver control parameters (end, after restore)")
+	s.series("final-bias", bias(0), 2)
+	s.pf("\nFull test duration: %s\n", time.Since(t0).Round(time.Second))
+}
+
+func (s *Session) Relink() error {
+	if err := s.cam.CloseDevice(); err != nil {
+		s.pf("  close device: %v\n", err)
+	}
+	time.Sleep(2 * time.Second)
+	if err := s.cam.OpenDevice(s.device, s.ip); err != nil {
+		return err
+	}
+	_, err := s.cam.EstablishLink()
+	if err == nil {
+		s.cam.CCDInfo(0)
+	}
+	return err
+}
+
+// Interpret prints observations derived from the results (heuristics, not proof).
+func (s *Session) Interpret() {
+	s.pl("\n== Observations (automatic, heuristic) ==")
+	by := map[string][]*FrameResult{}
+	var order []string
+	for _, r := range s.results {
+		if _, ok := by[r.Experiment]; !ok {
+			order = append(order, r.Experiment)
+		}
+		by[r.Experiment] = append(by[r.Experiment], r)
+	}
+	nbad := func(rs []*FrameResult) int {
+		k := 0
+		for _, r := range rs {
+			if bad(r) {
+				k++
+			}
+		}
+		return k
+	}
+	base := by["baseline-bias"]
+	if len(base) == 0 {
+		s.pl("- no baseline frames were taken")
+		return
+	}
+	nb := nbad(base)
+	switch {
+	case nb == 0:
+		s.pl("- The baseline bias frames are all fine: the fault did NOT reproduce in this run.")
+	case !bad(base[0]) && nb > 0:
+		s.pl("- First baseline frame fine, later ones bad: the fault develops after the first readout (as reported).")
+	default:
+		s.pf("- %d of %d baseline bias frames are bad (first frame: %s).\n", nb, len(base), base[0].Class)
+	}
+	if len(base) > 1 {
+		var tr []string
+		for _, r := range base {
+			tr = append(tr, fmt.Sprintf("%.0f", r.Stats.Mean))
+		}
+		s.pl("  baseline mean ADU sequence: " + strings.Join(tr, " -> "))
+	}
+	// Offsets measured by the camera.
+	for _, o := range s.offsets {
+		if o.Err == "" && o.Offset >= 60000 {
+			s.pl("- The camera's own offset measurement (CC_READ_OFFSET) is near full scale -> the analog chain/A-D sees a saturated")
+			s.pl("  signal even without a readout of the image: points at output amplifier / bias voltages / A-D, not at USB or software.")
+			break
+		}
+	}
+	cmp := func(exp, what string) {
+		rs := by[exp]
+		if len(rs) == 0 || nb == 0 {
+			return
+		}
+		k := nbad(rs)
+		switch {
+		case k == 0:
+			s.pf("- %s: ALL %d frame(s) GOOD while baseline was bad -> %s\n", exp, len(rs), what)
+		case k < len(rs):
+			s.pf("- %s: %d of %d frame(s) bad (partial improvement?)\n", exp, k, len(rs))
+		default:
+			s.pf("- %s: still bad\n", exp)
+		}
+	}
+	cmp("bin2x2", "binned readout works: a usable workaround mode and a clue to the clocking/readout path")
+	cmp("bin3x3", "3x3 binned readout works")
+	cmp("sub-top200", "top rows are fine")
+	cmp("sub-bottom200", "bottom rows are fine")
+	cmp("vddopt0-bias", "DCP_VDD_OPTIMIZED=0 FIXES short exposures (driver Vdd switching is involved)")
+	cmp("vddopt0-dark5", "DCP_VDD_OPTIMIZED=0 fixes 5 s darks")
+	cmp("skipvdd-dark5", "keeping Vdd on during integration fixes 5 s darks")
+	cmp("fifo0-bias", "disabling the USB FIFO fixes it (pipelining/data path issue)")
+	cmp("vflush0-bias", "disabling vertical flush control fixes it")
+	cmp("custopt-default-bias", "CAMERA CUSTOMER OPTIONS were the cause")
+	cmp("slow-readout", "slower readout fixes it (timing / power-supply droop during fast readout?)")
+	cmp("after-relink", "a software re-link clears the fault (camera state problem; reconnecting before each frame is a workaround)")
+	cmp("after-rest", "resting idle clears the fault (thermal or slowly-recovering supply?)")
+	for _, exp := range order {
+		if strings.HasPrefix(exp, "default-") {
+			cmp(exp, "resetting this parameter to its documented default fixes it")
+		}
+	}
+	// Overscan.
+	if rs := by["overscan-bias"]; len(rs) > 0 && rs[0].Class != "ERROR" {
+		s.pl("- Overscan frame: check the right-most columns / bottom rows in its _rows.csv / FITS; saturated overscan = analog chain fault.")
+	}
+	// Top/bottom sub-frames.
+	if t, b := by["sub-top200"], by["sub-bottom200"]; len(t) > 0 && len(b) > 0 && nb > 0 {
+		if !bad(t[0]) && bad(b[0]) {
+			s.pl("- Bottom rows bad but top rows good even in small subframes -> position on the CCD matters (not readout time).")
+		}
+		if bad(t[0]) && bad(b[0]) {
+			s.pl("- Both small subframes bad -> not a cumulative 'runs out during long readout' effect.")
+		}
+	}
+	// Stuck bits / dup rows / comm failures.
+	for _, r := range s.results {
+		for _, n := range r.Notes {
+			if strings.Contains(n, "stuck A/D bits") || strings.Contains(n, "exact copies") {
+				s.pf("- frame %d: %s\n", r.N, n)
+			}
+		}
+		if r.ComFailed > 0 {
+			s.pf("- frame %d: link comFailed increased by %d (USB communication errors)\n", r.N, r.ComFailed)
+		}
+		if r.PowerLow == "true" {
+			s.pf("- frame %d: POWER-SUPPLY-LOW bit set after readout -> check the 12 V supply/cable\n", r.N)
+		}
+	}
+	s.pl("Send the whole output folder (report.txt, summary.json, frames.csv, PNGs; FITS if possible) for analysis.")
+}
