@@ -54,9 +54,12 @@ func (s *Session) heading(name, why string) {
 
 // QuickTest reproduces the reported sequence: a handful of bias frames.
 func (s *Session) QuickTest(n int) {
-	s.heading("baseline bias series", "Repeats the failing sequence (0 s dark frames, 1x1, full frame).")
-	s.series("baseline-bias", bias(0), n)
-	s.SampleOffsets("after baseline", 3)
+	s.heading("baseline bias series", "Repeats the failing sequence (0 s dark frames, 1x1, full frame). "+
+		"SBIG sets the black level at the factory to ~900-1000 ADU, so a healthy bias frame has a median near that.")
+	for k := 0; k < n && !s.aborted(); k++ {
+		s.TakeFrame("baseline-bias", bias(0))
+		s.SampleOffsets(fmt.Sprintf("after baseline frame %d", k+1), 1)
+	}
 }
 
 // FullTest is the default diagnostic plan. Every changed setting is restored
@@ -127,6 +130,35 @@ func (s *Session) FullTest() {
 		s.withDCP(ii, uint32(dd), func() { s.series(fmt.Sprintf("default-%s", strings.TrimPrefix(dcpNames[ii], "DCP_")), bias(0), 2) })
 	}
 
+	if o, err := s.cam.GetCustomerOptions(); err == nil && o.VddNormallyOff == 0 {
+		s.heading("camera option vddNormallyOff = 1", "Turns the CCD output-amplifier supply (Vdd) fully OFF between exposures, "+
+			"which resets the output amplifier before every frame. Stored in the camera - restored right after.")
+		n := o
+		n.VddNormallyOff = 1
+		if err := s.SetOptionsTemp(n); err != nil {
+			s.pf("  could not change customer options: %v\n", err)
+		} else {
+			s.series("vddoff-bias", bias(0), 2)
+			s.series("vddoff-dark5", dark(5), 1)
+		}
+		s.RestoreAll()
+	}
+	if o, err := s.cam.GetCustomerOptions(); err == nil && o.Overscan == 0 {
+		s.heading("camera option overscanRegions = 1", "Camera-side overscan (pixels that never held charge). "+
+			"Saturated overscan => output amplifier / analog chain / A-D fault. Restored right after.")
+		n := o
+		n.Overscan = 1
+		if err := s.SetOptionsTemp(n); err != nil {
+			s.pf("  could not change customer options: %v\n", err)
+		} else {
+			if info, err := s.cam.CCDInfo(0); err == nil && len(info.Modes) > 0 {
+				s.pf("  frame size reported with overscan option: %dx%d\n", info.Modes[0].Width, info.Modes[0].Height)
+			}
+			s.series("custoverscan-bias", bias(0), 1)
+		}
+		s.RestoreAll()
+		s.cam.CCDInfo(0)
+	}
 	if o, err := s.cam.GetCustomerOptions(); err == nil && (o.Preflash != 0 || o.VddNormallyOff != 0) {
 		s.heading("camera customer options to factory defaults", "preflashCcd/vddNormallyOff are set in the camera; test with them off (restored afterwards).")
 		n := o
@@ -215,6 +247,9 @@ func (s *Session) Interpret() {
 	default:
 		s.pf("- %d of %d baseline bias frames are bad (first frame: %s).\n", nb, len(base), base[0].Class)
 	}
+	if med := base[0].Stats.Median; base[0].Class != "ERROR" && (med < 300 || med > 3000) {
+		s.pf("- First baseline frame median %.0f ADU is far from the factory black level (~900-1000 ADU).\n", med)
+	}
 	if len(base) > 1 {
 		var tr []string
 		for _, r := range base {
@@ -255,6 +290,9 @@ func (s *Session) Interpret() {
 	cmp("fifo0-bias", "disabling the USB FIFO fixes it (pipelining/data path issue)")
 	cmp("vflush0-bias", "disabling vertical flush control fixes it")
 	cmp("custopt-default-bias", "CAMERA CUSTOMER OPTIONS were the cause")
+	cmp("vddoff-bias", "switching Vdd off between frames (camera option vddNormallyOff=1) FIXES bias frames - a usable workaround (set it in CCDOps)")
+	cmp("vddoff-dark5", "vddNormallyOff=1 fixes 5 s darks")
+	cmp("custoverscan-bias", "the overscan-option frame is fine")
 	cmp("slow-readout", "slower readout fixes it (timing / power-supply droop during fast readout?)")
 	cmp("after-relink", "a software re-link clears the fault (camera state problem; reconnecting before each frame is a workaround)")
 	cmp("after-rest", "resting idle clears the fault (thermal or slowly-recovering supply?)")

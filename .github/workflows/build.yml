@@ -76,6 +76,8 @@ jobs:
             & $exe -info -nopause -dll "C:\nonexistent\SBIGUDrv.dll" | Select-Object -Last 5
             if ($LASTEXITCODE -ne 2) { throw "$exe expected exit 2 without driver, got $LASTEXITCODE" }
           }
+          Write-Host "Windows smoke tests passed"
+          exit 0
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

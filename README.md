@@ -89,6 +89,8 @@ also restored at the end of the run and on Ctrl+C or window close.
 | `DCP_VERT_FLUSH_CONTROL_ENABLE = 0` | Is background vertical flushing of the KAI CCD involved? |
 | `DCP_OVERSCAN_ROWSCOLS = 1` | Are pixels that never held charge also saturated? If yes, the fault is in the amplifier/analog chain/A-D, not charge on the CCD. |
 | any `DCP_*` not at its documented default | Does resetting it help? |
+| camera option `vddNormallyOff = 1` | Vdd fully off between exposures, which resets the output amplifier before every frame. A possible workaround. Restored afterwards. |
+| camera option `overscanRegions = 1` | Camera-side overscan, as above. Restored afterwards. |
 | camera customer options → factory (only if preflash or Vdd-off is set) | Is a stored camera option the cause? Restored afterwards. |
 | 2 ms pause per line | Does readout timing matter? |
 | re-link (close and reopen the device) | Does a software re-initialisation clear the state? |
@@ -103,8 +105,10 @@ Notes:
 
 - Driver control parameters belong to the process, not to the camera. Changing them
   here does not affect NINA, and they vanish when sbigdiag exits.
-- The camera "customer options" are stored in the camera. sbigdiag only changes them
-  when preflash or Vdd-off is set, and it restores them.
+- The camera "customer options" are stored in the camera. The full test changes
+  Vdd-off and overscan for one experiment each, and sets preflash or Vdd-off back to
+  the factory value only if one of them was already on. Every change is read back,
+  restored and verified straight away.
 - Cooling, fan and filter wheel are never touched.
 
 ## Command line
