@@ -40,6 +40,7 @@ jobs:
           ./sbigdiag -simulate -full -rest 1 -nopause -nofits -out simrun | tail -60
           test -s simrun/summary.json && test -s simrun/frames.csv && test -s simrun/report.txt
           grep -q "All changed settings are back to their original values" simrun/report.txt
+          ! grep -q "INTERNAL ERROR" simrun/report.txt
       - name: Cross-compile Windows executables
         run: |
           V=$(git describe --tags --always --dirty)
@@ -82,6 +83,7 @@ jobs:
             $rep = Get-Content "$d\report.txt" -Raw
             if ($rep -notmatch "camera-event log -> ") { throw "$d : camera-event log was not enabled" }
             if ($rep -match "RESTORE FAILED") { throw "$d : a restore failed" }
+            if ($rep -match "INTERNAL ERROR") { throw "$d : internal error (recovered panic)" }
           }
           $k = Get-ItemProperty -Path "HKCU:\Software\SBIG\SBIGUDRV\DebugLog" -ErrorAction SilentlyContinue
           if ($k -and ($k.PSObject.Properties.Name -contains "FilePathName")) { throw "DebugLog registry values were left behind" }

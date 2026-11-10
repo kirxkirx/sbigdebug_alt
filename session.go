@@ -72,6 +72,8 @@ type FrameResult struct {
 	Exact65535  bool              `json:"all_exactly_65535"`
 	Dark        bool              `json:"shutter_closed"`
 	LinesRead   int               `json:"lines_read"`
+	StrictClass string            `json:"class_with_bias_rules"` // class under the closed-shutter rules
+	FatalErr    string            `json:"fatal_error,omitempty"` // the error that ended the exposure/readout
 }
 
 type OffsetSample struct {
@@ -422,7 +424,7 @@ func (s *Session) TakeFrame(exp string, spec ExposureSpec) *FrameResult {
 	}
 	if f == nil {
 		s.pf("  EXPOSURE FAILED: %v\n", err)
-		r := &FrameResult{N: n, Experiment: exp, Spec: spec.Describe(), Time: time.Now().Format(time.RFC3339), Class: "ERROR", Errors: []string{fmt.Sprint(err)}, Dark: spec.Dark}
+		r := &FrameResult{N: n, Experiment: exp, Spec: spec.Describe(), Time: time.Now().Format(time.RFC3339), Class: "ERROR", Errors: []string{fmt.Sprint(err)}, Dark: spec.Dark, FatalErr: fmt.Sprint(err)}
 		s.results = append(s.results, r)
 		s.WriteJSON()
 		return r
@@ -432,6 +434,9 @@ func (s *Session) TakeFrame(exp string, spec ExposureSpec) *FrameResult {
 		s.pf("  readout error: %v (analysing the %d lines that were read)\n", err, f.LinesRead)
 	}
 	r := s.analyseFrame(n, exp, f)
+	if err != nil {
+		r.FatalErr = err.Error()
+	}
 	s.WriteJSON() // keep summary.json/frames.csv current in case the run is killed
 	return r
 }
@@ -446,8 +451,14 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 	if f.Spec.Dark {
 		a.ApplyDarkRules()
 	}
+	strict := *a // the same frame judged by the closed-shutter (bias) rules
+	strict.Notes = nil
+	if !f.Spec.Dark {
+		strict.ApplyDarkRules()
+	}
 	if partial {
 		a.Class = "PARTIAL"
+		strict.Class = "PARTIAL"
 	}
 	r := &FrameResult{N: n, Experiment: exp, Spec: f.Spec.Describe(), Time: f.Start.Format(time.RFC3339),
 		Class: a.Class, W: f.W, H: f.H, Stats: a.Stats, Boundaries: a.Boundaries, Segments: a.Segments,
@@ -455,7 +466,7 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 		LeftMed: a.LeftMedian, RightMed: a.RightMedian,
 		IntegrS: f.IntegrDone.Seconds(), ReadoutS: f.ReadoutTime.Seconds(), Errors: f.Errors,
 		CCDTempC: f.TempAfter.CCDTemp, HeatsinkC: f.TempAfter.HeatsinkTemp, PowerLow: f.PowerLowAfter,
-		Dark: f.Spec.Dark, LinesRead: f.LinesRead}
+		Dark: f.Spec.Dark, LinesRead: f.LinesRead, StrictClass: strict.Class}
 	r.ComFailed = int64(f.LinkAfter.ComFailed) - int64(f.LinkBefore.ComFailed)
 	r.Exact65535 = a.Stats.Full65535Frac > 0.999
 	phases := ""

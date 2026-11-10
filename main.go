@@ -283,7 +283,7 @@ func protectedDir(p string) bool {
 	return false
 }
 
-func runCamera(o options) int {
+func runCamera(o options) (code int) {
 	if o.sets != "" && !o.info && o.custom == "" && !o.quick {
 		fmt.Println("-set is only supported with -custom or -quick (the full test changes settings itself)")
 		return 2
@@ -355,6 +355,7 @@ func runCamera(o options) int {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(out, "\nINTERNAL ERROR: %v\n", r)
+			code = 4
 		}
 		fmt.Fprintln(out, "\n== Restoring settings and closing ==")
 		if !s.RestoreAll() {

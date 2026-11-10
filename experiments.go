@@ -323,6 +323,7 @@ func (s *Session) FullTest() {
 	s.RestoreAll()
 	s.DumpDCPs("Driver control parameters (end, after restore)")
 	s.series("final-bias", bias(0), 2)
+	s.series("final-dark5", dark(5), 1)
 	s.pf("\nFull test duration: %s\n", time.Since(t0).Round(time.Second))
 }
 
@@ -353,7 +354,35 @@ func (s *Session) Relink() error {
 // full frame, all settings at their original values); they show the camera's
 // state over time. 5 s dark experiments are compared with the default 5 s dark.
 var biasControls = []string{"baseline-bias", "shutter-close", "final-bias"}
-var darkControls = []string{"dark-5s"}
+var darkControls = []string{"dark-5s", "final-dark5"}
+
+// Experiments that change the camera state for good (not just while a setting is active).
+var resettingExps = []string{"after-relink", "relink-autoadgain0", "after-rest"}
+
+func isResetting(exp string) bool {
+	for _, e := range resettingExps {
+		if e == exp {
+			return true
+		}
+	}
+	return false
+}
+
+// faultStrict also applies the closed-shutter rules (level, gradient, steps) - used for
+// shutter-open frames of a covered telescope before claiming that they are "fine".
+func faultStrict(r *FrameResult) bool {
+	if fault(r) {
+		return true
+	}
+	if nodata(r) {
+		return false
+	}
+	switch r.StrictClass {
+	case "SATURATED", "CORRUPT", "ZERO", "ELEVATED", "GRADIENT", "STEP":
+		return true
+	}
+	return false
+}
 
 // Interpret prints observations derived from the results (heuristics, not proof).
 func (s *Session) Interpret() {
@@ -401,9 +430,9 @@ func (s *Session) Interpret() {
 	// Frames that failed outright.
 	for _, r := range s.results {
 		if r.Class == "ERROR" || r.Class == "PARTIAL" {
-			e := ""
-			if len(r.Errors) > 0 {
-				e = r.Errors[0]
+			e := r.FatalErr
+			if e == "" && len(r.Errors) > 0 {
+				e = r.Errors[len(r.Errors)-1]
 			}
 			s.pf("- frame %d (%s): no usable image (%s) %s\n", r.N, r.Experiment, r.Class, e)
 		}
@@ -448,21 +477,39 @@ func (s *Session) Interpret() {
 		}
 		s.pl("  baseline mean ADU sequence: " + strings.Join(tr, " -> "))
 	}
-	// Did the camera change state during the run (controls)?
+	// Did the camera change state during the run (control frames)?
+	wentBadAt := -1 // frame number from which later experiments cannot be attributed
 	for i := 1; i < len(bctl); i++ {
 		if fault(bctl[i-1]) && !fault(bctl[i]) {
-			s.pf("- The camera RECOVERED during the run: control frame %d (%s) is fine after faulty frame %d. Experiments after\n", bctl[i].N, bctl[i].Experiment, bctl[i-1].N)
-			s.pl("  frame " + fmt.Sprint(bctl[i-1].N) + " may look 'fixed' only because of that.")
+			cause := ""
+			for _, exp := range resettingExps {
+				if rs := withData(by[exp]); len(rs) > 0 && rs[0].N > bctl[i-1].N && rs[0].N < bctl[i].N && countFault(rs) == 0 {
+					cause = " - right after the '" + exp + "' step"
+					break
+				}
+			}
+			s.pf("- The camera RECOVERED during the run: control frame %d (%s) is fine after faulty frame %d%s.\n", bctl[i].N, bctl[i].Experiment, bctl[i-1].N, cause)
 			break
 		}
-		if !fault(bctl[i-1]) && fault(bctl[i]) && i > 0 && bctl[i-1].Experiment != "baseline-bias" {
-			s.pf("- The camera went BAD during the run between control frames %d and %d.\n", bctl[i-1].N, bctl[i].N)
+		if !fault(bctl[i-1]) && fault(bctl[i]) {
+			first := bctl[i]
+			for _, r := range all {
+				if r.N > bctl[i-1].N && fault(r) {
+					first = r
+					break
+				}
+			}
+			wentBadAt = first.N
+			s.pf("- The camera went BAD during the run between control frames %d and %d; first faulty frame: %d (%s).\n", bctl[i-1].N, bctl[i].N, first.N, first.Experiment)
+			s.pl("  Experiments after that frame cannot be attributed: the camera stayed faulty on its own.")
+			break
 		}
 	}
-	if b0 := base; len(b0) > 0 {
-		if d := withData(by["dark-5s"]); len(d) > 0 && nb > 0 && !fault(d[0]) {
-			s.pl("- The 5 s dark is fine while 0 s bias frames are faulty: exposure-length dependent (the driver lowers Vdd only for")
-			s.pl("  exposures >= 3 s - see the DCP_VDD_OPTIMIZED results).")
+	if d := withData(by["dark-5s"]); len(d) > 0 && !fault(d[0]) {
+		prev, next := prevNext(bctl, d[0].N, d[0].N)
+		if prev != nil && fault(prev) && (next == nil || fault(next)) {
+			s.pl("- The 5 s dark is fine while the 0 s bias frames around it are faulty: exposure-length dependent (the driver")
+			s.pl("  lowers Vdd only for exposures >= 3 s - see the DCP_VDD_OPTIMIZED results).")
 		}
 	}
 	for _, r := range all {
@@ -494,6 +541,7 @@ func (s *Session) Interpret() {
 			break
 		}
 	}
+	creditedReset := ""
 	cmp := func(exp, what string, controls []*FrameResult) {
 		rsAll := by[exp]
 		if len(rsAll) == 0 {
@@ -504,11 +552,32 @@ func (s *Session) Interpret() {
 			s.pf("- %s: no usable frame (%d failed/aborted) - no conclusion\n", exp, len(rsAll))
 			return
 		}
-		k := countFault(rs)
+		isFault := fault
+		if exp == "light-min" {
+			isFault = faultStrict // shutter-open frames of a covered telescope must look like bias frames
+		}
+		k := 0
+		for _, r := range rs {
+			if isFault(r) {
+				k++
+			}
+		}
 		prev, next := prevNext(controls, rs[0].N, rs[len(rs)-1].N)
+		if next == nil {
+			// e.g. a 5 s dark experiment with no later 5 s dark control: use the bias controls
+			_, next = prevNext(bctl, rs[0].N, rs[len(rs)-1].N)
+		}
 		prevBad := prev != nil && fault(prev)
 		nextBad := next != nil && fault(next)
 		switch {
+		case k == 0 && prevBad && isResetting(exp):
+			// re-link / rest change the camera state for good: judge against the frame before only
+			if creditedReset == "" {
+				creditedReset = exp
+				s.pf("- %s: ALL %d frame(s) GOOD right after this step, while the camera was faulty before (frame %d) -> %s\n", exp, len(rs), prev.N, what)
+			} else {
+				s.pf("- %s: good (the camera was already recovered by '%s')\n", exp, creditedReset)
+			}
 		case k == 0 && prevBad && (next == nil || nextBad):
 			after := ""
 			if next != nil {
@@ -516,13 +585,15 @@ func (s *Session) Interpret() {
 			}
 			s.pf("- %s: ALL %d frame(s) GOOD while the camera was faulty before (frame %d)%s -> %s\n", exp, len(rs), prev.N, after, what)
 		case k == 0 && prevBad:
-			s.pf("- %s: good, but the next control frame %d is good too: the camera may have recovered by itself (inconclusive)\n", exp, next.N)
+			s.pf("- %s: good, but the next control frame %d is good too: the camera may have recovered (inconclusive)\n", exp, next.N)
 		case k == 0:
 			// camera was fine before: nothing learned
 		case k < len(rs):
 			s.pf("- %s: %d of %d frame(s) faulty (partial)\n", exp, k, len(rs))
-		case prev != nil && !prevBad:
-			s.pf("- %s: FAULTY although the preceding control frame %d was fine -> this mode/setting TRIGGERS the fault\n", exp, prev.N)
+		case prev != nil && !prevBad && next != nil && !nextBad:
+			s.pf("- %s: FAULTY while the camera is fine before (frame %d) and after (frame %d) -> this mode/setting TRIGGERS the fault\n", exp, prev.N, next.N)
+		case wentBadAt >= 0 && rs[0].N > wentBadAt:
+			// after the camera went bad on its own: nothing to attribute (already reported once)
 		default:
 			s.pf("- %s: still faulty\n", exp)
 		}
