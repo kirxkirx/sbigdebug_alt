@@ -44,7 +44,7 @@ DL shipped in 2022 as the fix for the RBI-preflash bug, so the firmware is curre
 ## Quick start
 
 1. Download **`sbigdiag-win64.exe`** from the
-   [latest release](https://github.com/kirxkirx/sbigdiag/releases/latest) into a folder you can write to.
+   [latest release](https://github.com/kirxkirx/sbigdebug_alt/releases/latest) into a folder you can write to.
 2. **Disconnect the camera in NINA** (or close NINA, CCDOps and MaxIm). Only one program can own the camera.
 3. Double-click the exe and choose **3 (full diagnostic, about 10 minutes)**. Enter alone also selects option 3.
 4. When it finishes, send the whole `sbigdiag_<date>_<time>` folder that appears next to the exe.
