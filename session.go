@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +39,18 @@ type Session struct {
 	// from their original values; the signal handler then refuses to os.Exit.
 	nvPending    atomic.Bool
 	origOptsText atomic.Value
+	halted       atomic.Bool // a restore failed: no further experiment may run
+	haltReason   string
+}
+
+// halt stops the experiment sequence after a failed restore (continuing would run
+// every later experiment with a setting stuck at its test value).
+func (s *Session) halt(reason string) {
+	if s.halted.CompareAndSwap(false, true) {
+		s.haltReason = reason
+		s.info["status"] = "halted: " + reason
+		s.pf("\n!!! STOPPED: %s - the remaining experiments are skipped.\n", reason)
+	}
 }
 
 type FrameResult struct {
@@ -60,9 +74,11 @@ type FrameResult struct {
 	IntegrS     float64           `json:"integration_s"`
 	ReadoutS    float64           `json:"readout_s"`
 	SlowLines   string            `json:"slow_lines"`
-	CCDTempC    float64           `json:"ccd_temp_c"`
-	HeatsinkC   float64           `json:"heatsink_c"`
+	CCDTempC    *float64          `json:"ccd_temp_c"` // null when the temperature query failed
+	HeatsinkC   *float64          `json:"heatsink_c"`
 	ComFailed   int64             `json:"com_failed_delta"`
+	ComValid    bool              `json:"com_counters_valid"`
+	SHA256      string            `json:"pixels_sha256"`
 	PowerLow    string            `json:"power_low_bit"`
 	DCPs        map[string]uint32 `json:"dcps"`
 	RowMedian   []float64         `json:"row_median_binned"`
@@ -215,7 +231,7 @@ func (s *Session) Info() {
 	t := c.Temperature()
 	s.pf("Temperature: %s\n", t)
 	s.info["temperature"] = t.String()
-	if t.Valid && t.Advanced && t.CoolingEnabled&1 != 0 && t.CoolerPower < 0.5 && t.CCDTemp > t.Setpoint+1 {
+	if t.Valid && t.Advanced && t.CoolingEnabled&1 != 0 && !t.Frozen() && t.CoolerPower < 0.5 && t.CCDTemp > t.Setpoint+1 {
 		s.pl("  !!! Cooling is ENABLED but the cooler gets 0% power while the CCD is above the setpoint.")
 		s.pl("      The STXL switches its TE cooler off when the input voltage is <= 10.25 V (manual). Check the 12 V supply,")
 		s.pl("      cable and the voltage LEDs on the side of the camera (green / 11V / 10V / 9V) - 9V lit = unreliable operation.")
@@ -337,6 +353,9 @@ func (s *Session) SetOptionsTemp(o CustomerOptions) error {
 	}
 	s.origOptsText.Store(s.origOpts.String())
 	s.nvPending.Store(true)
+	if err := writeJournal(Journal{Original: *s.origOpts, ChangedTo: o, Time: time.Now().Format(time.RFC3339), Dir: s.dir}); err != nil {
+		s.pf("  (restore journal not written: %v)\n", err)
+	}
 	if err := s.cam.SetCustomerOptions(o); err != nil {
 		return err
 	}
@@ -396,6 +415,7 @@ func (s *Session) restoreOptions() bool {
 			s.pf("  restored customer options: %s\n", rb)
 			s.origOpts = nil
 			s.nvPending.Store(false)
+			removeJournal()
 			return true
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -465,9 +485,17 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 		Notes: a.Notes, BitFrac: a.BitFrac, FirstSatRow: a.FirstSatRow, TopMed: a.TopMedian, BottomMed: a.BottomMedian,
 		LeftMed: a.LeftMedian, RightMed: a.RightMedian,
 		IntegrS: f.IntegrDone.Seconds(), ReadoutS: f.ReadoutTime.Seconds(), Errors: f.Errors,
-		CCDTempC: f.TempAfter.CCDTemp, HeatsinkC: f.TempAfter.HeatsinkTemp, PowerLow: f.PowerLowAfter,
-		Dark: f.Spec.Dark, LinesRead: f.LinesRead, StrictClass: strict.Class}
-	r.ComFailed = int64(f.LinkAfter.ComFailed) - int64(f.LinkBefore.ComFailed)
+		PowerLow: f.PowerLowAfter,
+		Dark:     f.Spec.Dark, LinesRead: f.LinesRead, StrictClass: strict.Class}
+	if f.TempAfter.Valid && f.TempAfter.Advanced {
+		ct, hs := f.TempAfter.CCDTemp, f.TempAfter.HeatsinkTemp
+		r.CCDTempC, r.HeatsinkC = &ct, &hs
+	}
+	r.ComValid = f.LinkValid
+	if f.LinkValid {
+		r.ComFailed = int64(f.LinkAfter.ComFailed) - int64(f.LinkBefore.ComFailed)
+	}
+	r.SHA256 = pixelHash(f.Pix)
 	r.Exact65535 = a.Stats.Full65535Frac > 0.999
 	phases := ""
 	if f.PhasesValid {
@@ -483,8 +511,12 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 			r.DCPs[dcpNames[i]] = v
 		}
 	}
-	s.pf("  => %s   integration %.2f s, readout %.2f s, CCD %.1f C, heatsink %.1f C, comFailed +%d, PS-low %s\n",
-		a.Class, r.IntegrS, r.ReadoutS, r.CCDTempC, r.HeatsinkC, r.ComFailed, r.PowerLow)
+	com := "n/a"
+	if r.ComValid {
+		com = fmt.Sprintf("+%d", r.ComFailed)
+	}
+	s.pf("  => %s   integration %.2f s, readout %.2f s, CCD %s C, heatsink %s C, comFailed %s, PS-low %s\n",
+		a.Class, r.IntegrS, r.ReadoutS, fmtTemp(r.CCDTempC), fmtTemp(r.HeatsinkC), com, r.PowerLow)
 	if phases != "" {
 		s.pl(phases)
 	}
@@ -531,17 +563,22 @@ func (s *Session) fitsCards(f *Frame, exp string, r *FrameResult) []fitsCard {
 		{"READMODE", readoutModeName(f.Spec.Mode), "SBIG readout mode"},
 		{"SUBTOP", f.Spec.Top, "subframe top (binned px)"},
 		{"SUBLEFT", f.Spec.Left, "subframe left (binned px)"},
-		{"CCD-TEMP", f.TempAfter.CCDTemp, "after readout [C]"},
-		{"HSINK-T", f.TempAfter.HeatsinkTemp, "heatsink after readout [C]"},
-		{"COOLPWR", f.TempAfter.CoolerPower, "cooler power [%]"},
 		{"INTEGR-S", r.IntegrS, "start to integration complete [s]"},
 		{"READOUTS", r.ReadoutS, "readout duration [s]"},
-		{"COMFAIL", int(r.ComFailed), "link comFailed increase"},
 		{"SBIGTEST", exp, "sbigdiag experiment"},
 		{"SBIGSPEC", f.Spec.Describe(), ""},
 		{"ROWORDER", "TOP-DOWN", "row 0 = first line returned by driver"},
 		{"SWCREATE", "sbigdiag " + version, ""},
 	}
+	if f.TempAfter.Valid && f.TempAfter.Advanced { // only real readings, never zeros for "unknown"
+		cards = append(cards, fitsCard{"CCD-TEMP", f.TempAfter.CCDTemp, "after readout [C]"},
+			fitsCard{"HSINK-T", f.TempAfter.HeatsinkTemp, "heatsink after readout [C]"},
+			fitsCard{"COOLPWR", f.TempAfter.CoolerPower, "cooler power [%]"})
+	}
+	if r.ComValid {
+		cards = append(cards, fitsCard{"COMFAIL", int(r.ComFailed), "link comFailed increase"})
+	}
+	cards = append(cards, fitsCard{"PIXSHA", r.SHA256[:min(16, len(r.SHA256))], "first 16 hex of pixel SHA-256"})
 	short := map[string]string{"DCP_VDD_OPTIMIZED": "VDDOPT", "DCP_HIGH_THROUGHPUT": "HITHRU", "DCP_USB_FIFO_ENABLE": "USBFIFO",
 		"DCP_VERT_FLUSH_CONTROL_ENABLE": "VFLUSH", "DCP_OVERSCAN_ROWSCOLS": "OVRSCAN", "DCP_AUTO_AD_GAIN": "AUTOADG"}
 	keys := make([]string, 0, len(r.DCPs))
@@ -661,7 +698,7 @@ func (s *Session) WriteJSON() {
 	}
 	for _, r := range s.results {
 		r.TopMed, r.BottomMed, r.LeftMed, r.RightMed = finite(r.TopMed), finite(r.BottomMed), finite(r.LeftMed), finite(r.RightMed)
-		r.IntegrS, r.ReadoutS, r.CCDTempC, r.HeatsinkC = finite(r.IntegrS), finite(r.ReadoutS), finite(r.CCDTempC), finite(r.HeatsinkC)
+		r.IntegrS, r.ReadoutS = finite(r.IntegrS), finite(r.ReadoutS)
 		for i := range r.RowMedian {
 			r.RowMedian[i] = finite(r.RowMedian[i])
 		}
@@ -701,8 +738,129 @@ func (s *Session) WriteJSON() {
 		w.Write([]string{fmt.Sprint(r.N), r.Experiment, r.Spec, r.Class, fmt.Sprintf("%.0f", r.Stats.Median), fmt.Sprintf("%.1f", r.Stats.Mean),
 			fmt.Sprintf("%.1f", r.Stats.Std), fmt.Sprintf("%.1f", r.Stats.RobustSigma), fmt.Sprintf("%.4f", r.Stats.SatFrac),
 			fmt.Sprintf("%.0f", r.TopMed), fmt.Sprintf("%.0f", r.BottomMed), fmt.Sprint(r.FirstSatRow), strings.Join(bs, " "),
-			fmt.Sprintf("%.2f", r.IntegrS), fmt.Sprintf("%.2f", r.ReadoutS), fmt.Sprintf("%.2f", r.CCDTempC), fmt.Sprintf("%.2f", r.HeatsinkC),
+			fmt.Sprintf("%.2f", r.IntegrS), fmt.Sprintf("%.2f", r.ReadoutS), csvTemp(r.CCDTempC), csvTemp(r.HeatsinkC),
 			fmt.Sprint(r.ComFailed), r.PowerLow, r.File})
 	}
 	w.Flush()
+}
+
+func fmtTemp(t *float64) string {
+	if t == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f", *t)
+}
+
+func csvTemp(t *float64) string {
+	if t == nil {
+		return ""
+	}
+	return fmt.Sprintf("%.2f", *t)
+}
+
+// pixelHash identifies the exact pixel content of a frame (to catch a driver or
+// camera buffer that delivers the same image twice).
+func pixelHash(p []uint16) string {
+	h := sha256.New()
+	buf := make([]byte, 0, 1<<16)
+	for i, v := range p {
+		buf = append(buf, byte(v), byte(v>>8))
+		if len(buf) == cap(buf) || i == len(p)-1 {
+			h.Write(buf)
+			buf = buf[:0]
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// --- restore journal for camera customer options ---
+//
+// Camera options live in the camera's non-volatile memory. If sbigdiag is killed
+// (driver crash, forced kill, power loss) while one is changed, the journal lets the
+// next start put it back.
+
+type Journal struct {
+	Original  CustomerOptions `json:"original"`
+	ChangedTo CustomerOptions `json:"changed_to"`
+	Time      string          `json:"time"`
+	Dir       string          `json:"run_dir"`
+}
+
+func journalPath() string {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(d, "sbigdiag", "pending_restore.json")
+}
+
+func writeJournal(j Journal) error {
+	p := journalPath()
+	if p == "" {
+		return errors.New("no user config dir")
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(j, "", " ")
+	f, err := os.Create(p)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func removeJournal() {
+	if p := journalPath(); p != "" {
+		os.Remove(p)
+	}
+}
+
+// RecoverJournal runs right after connecting: it restores camera options that an
+// earlier, interrupted sbigdiag run left changed.
+func (s *Session) RecoverJournal() {
+	p := journalPath()
+	if p == "" {
+		return
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var j Journal
+	if json.Unmarshal(b, &j) != nil {
+		s.pf("Restore journal %s is unreadable - removed.\n", p)
+		removeJournal()
+		return
+	}
+	cur, err := s.cam.GetCustomerOptions()
+	if err != nil {
+		s.pf("Restore journal found (%s), but the camera options cannot be read (%v) - kept for the next run.\n", p, err)
+		return
+	}
+	switch cur {
+	case j.ChangedTo:
+		s.pf("\n!!! An earlier sbigdiag run (%s) was interrupted while camera options were changed: %s\n", j.Time, cur)
+		if err := s.cam.SetCustomerOptions(j.Original); err == nil {
+			if rb, err := s.cam.GetCustomerOptions(); err == nil && rb == j.Original {
+				s.pf("!!! Restored them to the original values: %s\n", rb)
+				removeJournal()
+				return
+			}
+		}
+		s.pf("!!! Could not restore them - please set them in CCDOps (Camera Setup -> Customer Options): %s\n", j.Original)
+	case j.Original:
+		removeJournal() // already back to the original values
+	default:
+		s.pf("Restore journal from %s: the camera options (%s) were changed since; left as they are.\n", j.Time, cur)
+		removeJournal()
+	}
 }

@@ -22,7 +22,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.23"
       - name: gofmt / vet / unit tests
         run: |
           test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }

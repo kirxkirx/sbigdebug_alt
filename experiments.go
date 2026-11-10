@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -74,7 +76,11 @@ func (s *Session) withDCP(i int, v uint32, fn func()) {
 		fn()
 		return
 	}
-	defer s.restoreDCP(i)
+	defer func() {
+		if !s.restoreDCP(i) {
+			s.halt(dcpNames[i] + " could not be restored")
+		}
+	}()
 	if err := s.SetDCPTemp(i, v); err != nil {
 		s.pf("  could not set %s=%d: %v\n", dcpNames[i], v, err)
 		return
@@ -88,7 +94,11 @@ func (s *Session) withOptions(o CustomerOptions, fn func()) {
 	if s.aborted() {
 		return
 	}
-	defer s.restoreOptions()
+	defer func() {
+		if !s.restoreOptions() {
+			s.halt("the camera customer options could not be restored")
+		}
+	}()
 	if err := s.SetOptionsTemp(o); err != nil {
 		s.pf("  could not change customer options: %v\n", err)
 		return
@@ -99,7 +109,7 @@ func (s *Session) withOptions(o CustomerOptions, fn func()) {
 // heading prints an experiment title; it returns false once the run is aborted,
 // so that no further experiment (and no further setting change) is started.
 func (s *Session) heading(name, why string) bool {
-	if s.aborted() {
+	if s.aborted() || s.halted.Load() {
 		return false
 	}
 	s.pf("\n==== Experiment: %s ====\n", name)
@@ -164,8 +174,8 @@ func (s *Session) FullTest() {
 		return
 	}
 	s.withDCP(DCP_VDD_OPTIMIZED, 0, func() {
-		s.series("vddopt0-bias", bias(0), 2)
-		s.series("vddopt0-dark5", dark(5), 1)
+		s.series("vddopt0-bias", bias(0), 3)
+		s.series("vddopt0-dark5", dark(5), 2)
 	})
 
 	if !s.heading("START_SKIP_VDD", "Keeps Vdd ON during the integration (no lowering at all) for a 5 s dark.") {
@@ -173,12 +183,12 @@ func (s *Session) FullTest() {
 	}
 	skip := dark(5)
 	skip.CCDFlags = START_SKIP_VDD
-	s.series("skipvdd-dark5", skip, 1)
+	s.series("skipvdd-dark5", skip, 2)
 
 	if !s.heading("DCP_USB_FIFO_ENABLE = 0", "Disables the camera FIFO/pipelining: pixels are digitized only when each line is requested.") {
 		return
 	}
-	s.withDCP(DCP_USB_FIFO_ENABLE, 0, func() { s.series("fifo0-bias", bias(0), 2) })
+	s.withDCP(DCP_USB_FIFO_ENABLE, 0, func() { s.series("fifo0-bias", bias(0), 3) })
 
 	if !s.heading("DCP_VERT_FLUSH_CONTROL_ENABLE = 0", "Disables background vertical flushing of the KAI CCD during integration (SBIG test setting).") {
 		return
@@ -189,7 +199,7 @@ func (s *Session) FullTest() {
 		"(the camera keeps its power-up A/D settings). Tests whether the driver's A/D writes are involved.") {
 		return
 	}
-	s.withDCP(DCP_AUTO_AD_GAIN, 0, func() { s.series("autoadgain0-bias", bias(0), 2) })
+	s.withDCP(DCP_AUTO_AD_GAIN, 0, func() { s.series("autoadgain0-bias", bias(0), 3) })
 
 	if v, err := s.cam.GetDCP(DCP_PIXEL_PIPELINE_ENABLE); err == nil && v != 0 {
 		if !s.heading("DCP_PIXEL_PIPELINE_ENABLE = 0", "Disables the driver's pixel pipelining (data path test).") {
@@ -243,8 +253,8 @@ func (s *Session) FullTest() {
 		n := o
 		n.VddNormallyOff = 1
 		s.withOptions(n, func() {
-			s.series("vddoff-bias", bias(0), 2)
-			s.series("vddoff-dark5", dark(5), 1)
+			s.series("vddoff-bias", bias(0), 3)
+			s.series("vddoff-dark5", dark(5), 2)
 		})
 	}
 	if o, err := s.cam.GetCustomerOptions(); err == nil && o.Overscan == 0 {
@@ -285,7 +295,7 @@ func (s *Session) FullTest() {
 	}
 	slow := bias(0)
 	slow.LineDelay = 2 * time.Millisecond
-	s.series("slow-readout", slow, 1)
+	s.series("slow-readout", slow, 2)
 
 	if !s.heading("re-link", "Close and reopen the camera connection (software re-initialisation, no power cycle).") {
 		return
@@ -293,7 +303,7 @@ func (s *Session) FullTest() {
 	if err := s.Relink(); err != nil {
 		s.pf("  re-link failed: %v\n", err)
 	} else {
-		s.series("after-relink", bias(0), 2)
+		s.series("after-relink", bias(0), 3)
 	}
 
 	if !s.heading("re-link with DCP_AUTO_AD_GAIN = 0", "Re-initialise the connection while the driver does not touch the A/D gain.") {
@@ -315,7 +325,7 @@ func (s *Session) FullTest() {
 		time.Sleep(100 * time.Millisecond)
 	}
 	s.SampleOffsets("after rest", 2)
-	s.series("after-rest", bias(0), 1)
+	s.series("after-rest", bias(0), 2)
 
 	if !s.heading("final baseline", "All settings restored; repeat the baseline.") {
 		return
@@ -387,6 +397,9 @@ func faultStrict(r *FrameResult) bool {
 // Interpret prints observations derived from the results (heuristics, not proof).
 func (s *Session) Interpret() {
 	s.pl("\n== Observations (automatic, heuristic) ==")
+	if s.halted.Load() {
+		s.pf("- THE RUN WAS STOPPED EARLY: %s. Settings may not all be at their original values - see 'Restoring settings' below.\n", s.haltReason)
+	}
 	by := map[string][]*FrameResult{}
 	var order []string
 	for _, r := range s.results {
@@ -570,6 +583,8 @@ func (s *Session) Interpret() {
 		prevBad := prev != nil && fault(prev)
 		nextBad := next != nil && fault(next)
 		switch {
+		case k == 0 && prevBad && len(rs) == 1:
+			s.pf("- %s: 1 good frame while the camera was faulty before (frame %d) - suggestive only, not confirmed (%s?)\n", exp, prev.N, what)
 		case k == 0 && prevBad && isResetting(exp):
 			// re-link / rest change the camera state for good: judge against the frame before only
 			if creditedReset == "" {
@@ -589,7 +604,15 @@ func (s *Session) Interpret() {
 		case k == 0:
 			// camera was fine before: nothing learned
 		case k < len(rs):
-			s.pf("- %s: %d of %d frame(s) faulty (partial)\n", exp, k, len(rs))
+			var seq []string
+			for _, r := range rs {
+				seq = append(seq, r.Class)
+			}
+			extra := ""
+			if !isFault(rs[0]) && isFault(rs[len(rs)-1]) {
+				extra = " - good right after the change, then faulty again (transient, like after power-on)"
+			}
+			s.pf("- %s: %d of %d frame(s) faulty: %s%s\n", exp, k, len(rs), strings.Join(seq, " -> "), extra)
 		case prev != nil && !prevBad && next != nil && !nextBad:
 			s.pf("- %s: FAULTY while the camera is fine before (frame %d) and after (frame %d) -> this mode/setting TRIGGERS the fault\n", exp, prev.N, next.N)
 		case wentBadAt >= 0 && rs[0].N > wentBadAt:
@@ -642,12 +665,71 @@ func (s *Session) Interpret() {
 				s.pf("- frame %d: %s\n", r.N, n)
 			}
 		}
-		if r.ComFailed > 0 {
+		if r.ComValid && r.ComFailed > 0 {
 			s.pf("- frame %d: link comFailed increased by %d (USB communication errors)\n", r.N, r.ComFailed)
 		}
 		if r.PowerLow == "true" {
 			s.pf("- frame %d: POWER-SUPPLY-LOW bit set after readout -> check the 12 V supply/cable\n", r.N)
 		}
 	}
+	seen := map[string]int{}
+	for _, r := range all {
+		if r.SHA256 == "" || r.Stats.Min == r.Stats.Max {
+			continue // constant frames (e.g. all 65535) are trivially identical
+		}
+		if first, ok := seen[r.SHA256]; ok {
+			s.pf("- frame %d is BIT-IDENTICAL to frame %d: the driver/camera delivered the same image twice (stale buffer / transfer path)\n", r.N, first)
+			continue
+		}
+		seen[r.SHA256] = r.N
+	}
 	s.pl("Send the whole output folder (report.txt, summary.json, frames.csv, PNGs; FITS if possible) for analysis.")
+}
+
+// fullTestFrames is the approximate number of full-size 1x1 frames FullTest takes.
+const fullTestFrames = 50
+
+// preflight prints the plan, checks the free disk space (FITS are dropped if it is
+// short) and, when the operator chose the run in the menu, asks for confirmation:
+// the full test opens the shutter and briefly changes camera options.
+func (s *Session) preflight(o options, interactive bool) bool {
+	frames, mins := fullTestFrames, 12
+	what := "the FULL test"
+	switch {
+	case o.custom != "":
+		frames, mins, what = o.frames, 1+o.frames/4, "a custom series"
+	case o.quick:
+		frames, mins, what = o.frames, 1+o.frames/4, "the quick test"
+	}
+	perFrame := uint64(2*4008*2672 + 700_000) // FITS + PNG + CSV of a full 1x1 frame
+	if s.cam != nil && s.cam.Info != nil {
+		if m, ok := s.cam.Info.Mode(0); ok && m.Width > 0 {
+			perFrame = uint64(2*m.Width*m.Height + 700_000)
+		}
+	}
+	need := uint64(frames) * perFrame
+	s.pf("\n== Plan: %s, about %d frames, about %d min, about %.1f GB of files ==\n", what, frames, mins, float64(need)/1e9)
+	if what == "the FULL test" {
+		s.pl("  * Keep the telescope covered / the dome dark: the shutter opens for 2 short frames.")
+		s.pl("  * Driver settings and two camera options (vddNormallyOff, overscan) are changed briefly, one at a time,")
+		s.pl("    and put back right after each experiment. Cooling, fan and filter wheel are not touched.")
+	}
+	if s.dir != "" && s.saveFITS {
+		if free, ok := freeBytes(s.dir); ok && free < need+1_000_000_000 {
+			s.saveFITS = false
+			s.pf("  ! Only %.1f GB free on the output drive: FITS files are NOT saved (PNG/CSV/summary are).\n", float64(free)/1e9)
+		}
+	}
+	if !interactive {
+		return true
+	}
+	flushConsoleInput()
+	fmt.Print("Start now? [Y/n]: ")
+	l, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	a := strings.ToLower(strings.TrimSpace(l))
+	if (err != nil && a == "") || a == "n" || a == "no" || a == "q" {
+		s.pl("Cancelled - nothing was changed.")
+		return false
+	}
+	return true
 }

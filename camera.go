@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,22 +50,50 @@ type Camera struct {
 	CameraType uint16
 	Info       *CCDInfo
 	noStatus2  bool
+	// busyCmd/busySince describe the driver call in progress (-1 = none); read by the
+	// hang watchdog goroutine, which never calls the driver itself.
+	busyCmd   atomic.Int32
+	busySince atomic.Int64
 }
 
-func NewCamera(t transport, trace io.Writer) *Camera { return &Camera{t: t, trace: trace} }
+func NewCamera(t transport, trace io.Writer) *Camera {
+	c := &Camera{t: t, trace: trace}
+	c.busyCmd.Store(-1)
+	return c
+}
+
+// Busy reports the driver call in progress, if any.
+func (c *Camera) Busy() (int, time.Time) {
+	return int(c.busyCmd.Load()), time.Unix(0, c.busySince.Load())
+}
+
+// call is the single place where the driver is entered: it marks the call as busy
+// for the watchdog around the raw transport call.
+func (c *Camera) call(id uint16, p, r []byte) uint16 {
+	c.busySince.Store(time.Now().UnixNano())
+	c.busyCmd.Store(int32(id))
+	code := c.t.Call(id, p, r)
+	c.busyCmd.Store(-1)
+	return code
+}
 
 func (c *Camera) tracef(format string, a ...interface{}) {
 	if c.trace != nil {
-		fmt.Fprintf(c.trace, time.Now().Format("15:04:05.000")+" "+format+"\n", a...)
+		fmt.Fprintf(c.trace, time.Now().Format("2006-01-02T15:04:05.000000-07:00")+" "+format+"\n", a...)
 	}
 }
 
 func (c *Camera) cmd(id uint16, p, r []byte) error {
+	// The "->" line is written BEFORE the call, so that a driver crash or hang still
+	// leaves the call in progress in driver_calls.log (readout lines: see Expose).
+	if id != CC_READOUT_LINE {
+		c.tracef("-> %-28s params=% x", cmdName(id), p)
+	}
 	t0 := time.Now()
-	code := c.t.Call(id, p, r)
+	code := c.call(id, p, r)
 	if id != CC_READOUT_LINE || code != 0 {
-		c.tracef("%-30s rc=%-3d %-24s %8.1f ms params=% x", cmdName(id), code, errName(code),
-			float64(time.Since(t0).Microseconds())/1000, p)
+		c.tracef("<- %-28s rc=%-3d %-24s %8.1f ms", cmdName(id), code, errName(code),
+			float64(time.Since(t0).Microseconds())/1000)
 	}
 	if code == 0 {
 		return nil
@@ -76,7 +105,8 @@ func (c *Camera) errorString(code uint16) string {
 	p := L_GetErrorStringParams.New()
 	L_GetErrorStringParams.Put16(p, "errorNo", code)
 	r := L_GetErrorStringResults.New()
-	if c.t.Call(CC_GET_ERROR_STRING, p, r) != 0 {
+	c.tracef("-> CC_GET_ERROR_STRING          errorNo=%d", code)
+	if c.call(CC_GET_ERROR_STRING, p, r) != 0 {
 		return ""
 	}
 	return L_GetErrorStringResults.Str(r, "errorString", 64)
@@ -321,12 +351,19 @@ func (t TempStatus) String() string {
 		return "unavailable"
 	}
 	if t.Advanced {
-		return fmt.Sprintf("CCD %.2f C, setpoint %.2f C, cooling %s (%.0f%%), heatsink %.2f C, ambient %.2f C, fan %d (%.0f%%, %.0f rpm)",
-			t.CCDTemp, t.Setpoint, onoff(t.CoolingEnabled&1 != 0), t.CoolerPower, t.HeatsinkTemp, t.AmbientTemp,
+		frozen := ""
+		if t.Frozen() {
+			frozen = ", TE frozen"
+		}
+		return fmt.Sprintf("CCD %.2f C, setpoint %.2f C, cooling %s (%.0f%%%s), heatsink %.2f C, ambient %.2f C, fan %d (%.0f%%, %.0f rpm)",
+			t.CCDTemp, t.Setpoint, onoff(t.CoolingEnabled&1 != 0), t.CoolerPower, frozen, t.HeatsinkTemp, t.AmbientTemp,
 			t.FanEnabled, t.FanPower, t.FanSpeed)
 	}
 	return t.Raw
 }
+
+// Frozen: the TE regulation is frozen (REGULATION_FROZEN_MASK), e.g. during a readout.
+func (t TempStatus) Frozen() bool { return t.CoolingEnabled&0x8000 != 0 }
 
 func onoff(b bool) string {
 	if b {
@@ -595,6 +632,7 @@ type Frame struct {
 	TempAfter     TempStatus
 	LinkBefore    LinkStatus
 	LinkAfter     LinkStatus
+	LinkValid     bool // both link-status queries succeeded
 	PowerLowAfter string
 	Errors        []string
 	DCPs          map[string]uint32
@@ -616,6 +654,9 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	if !ok {
 		return nil, fmt.Errorf("camera does not report readout mode %s", readoutModeName(s.Mode))
 	}
+	if s.Top < 0 || s.Left < 0 || s.Width < 0 || s.Height < 0 {
+		return nil, fmt.Errorf("negative subframe value")
+	}
 	w, h := s.Width, s.Height
 	if w <= 0 {
 		w = m.Width - s.Left
@@ -628,7 +669,9 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	}
 	f := &Frame{Spec: s, W: w, H: h}
 	f.TempBefore = c.Temperature()
-	f.LinkBefore, _ = c.LinkStatus()
+	var lerr error
+	f.LinkBefore, lerr = c.LinkStatus()
+	f.LinkValid = lerr == nil
 
 	ticks := uint32(math.Round(s.Seconds * 100))
 	if ticks > EXP_TIME_MASK {
@@ -735,6 +778,9 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 			readErr = errAborted
 			break
 		}
+		if y == 0 || y%256 == 0 || y == h-1 {
+			c.tracef("-> CC_READOUT_LINE row %d/%d", y, h)
+		}
 		lt := time.Now()
 		if err := c.cmd(CC_READOUT_LINE, rl, line); err != nil {
 			readErr = fmt.Errorf("line %d: %w", y, err)
@@ -757,7 +803,11 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	}
 	f.ReadoutTime = time.Since(t0)
 	f.TempAfter = c.Temperature()
-	f.LinkAfter, _ = c.LinkStatus()
+	if la, err := c.LinkStatus(); err == nil {
+		f.LinkAfter = la
+	} else {
+		f.LinkValid = false
+	}
 	if pl, err := c.PowerLow(); err == nil {
 		f.PowerLowAfter = fmt.Sprintf("%v", pl)
 	} else {

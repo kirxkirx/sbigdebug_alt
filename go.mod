@@ -1,3 +1,3 @@
 module github.com/kirxkirx/sbigdebug_alt
 
-go 1.21
+go 1.23

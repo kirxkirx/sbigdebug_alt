@@ -404,3 +404,40 @@ func setDebugLogRegistry(path string, flags [4]uint32) error {
 	}
 	return set("FilePathName", syscall.REG_SZ, b)
 }
+
+var procSetThreadExecutionState = modKernel32.NewProc("SetThreadExecutionState")
+
+// preventSleep keeps Windows from suspending during the run (a suspended PC resets
+// the USB link mid-readout, which would look exactly like the camera fault).
+// Call on the main (locked) thread; allowSleep undoes it.
+func preventSleep() bool {
+	r, _, _ := procSetThreadExecutionState.Call(uintptr(0x80000000 | 0x00000001)) // ES_CONTINUOUS|ES_SYSTEM_REQUIRED
+	return r != 0
+}
+
+func allowSleep() { procSetThreadExecutionState.Call(uintptr(0x80000000)) }
+
+var procGetDiskFreeSpaceExW = modKernel32.NewProc("GetDiskFreeSpaceExW")
+
+// freeBytes reports the free space available to the user on dir's volume.
+func freeBytes(dir string) (uint64, bool) {
+	p, err := syscall.UTF16PtrFromString(dir)
+	if err != nil {
+		return 0, false
+	}
+	var avail, total, free uint64
+	r, _, _ := procGetDiskFreeSpaceExW.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&avail)),
+		uintptr(unsafe.Pointer(&total)), uintptr(unsafe.Pointer(&free)))
+	return avail, r != 0
+}
+
+// stdinIsConsole: true when a person can type answers (not a pipe, file or NUL).
+func stdinIsConsole() bool {
+	h, _, _ := procGetStdHandle.Call(uintptr(^uint32(10 - 1))) // STD_INPUT_HANDLE
+	if h == 0 || h == ^uintptr(0) {
+		return false
+	}
+	var mode uint32
+	r, _, _ := procGetConsoleMode.Call(h, uintptr(unsafe.Pointer(&mode)))
+	return r != 0
+}

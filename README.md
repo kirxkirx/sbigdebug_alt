@@ -46,7 +46,9 @@ DL shipped in 2022 as the fix for the RBI-preflash bug, so the firmware is curre
 1. Download **`sbigdiag-win64.exe`** from the
    [latest release](https://github.com/kirxkirx/sbigdebug_alt/releases/latest) into a folder you can write to.
 2. **Disconnect the camera in NINA** (or close NINA, CCDOps and MaxIm). Only one program can own the camera.
-3. Double-click the exe and choose **3 (full diagnostic, about 10 minutes)**. Enter alone also selects option 3.
+3. Double-click the exe and choose **3 (full diagnostic, about 12 minutes)**. Enter alone also selects option 3.
+   It prints the plan (frames, time, disk space) and asks before starting. **Cover the telescope or keep the
+   dome dark**: the shutter opens for two short frames.
 4. When it finishes, send the whole `sbigdiag_<date>_<time>` folder that appears next to the exe.
    If the folder is too large, send everything except the `.fits` files.
 
@@ -67,6 +69,9 @@ Each exe only ever loads a DLL of its own bitness.
 
 ## What it reports
 
+- **Which driver DLL was tested**: path, version, SHA-256 and the name of the build if it is a known one
+  (e.g. "SBIGUDrv 4.99 Build 8 x64 = the copy NINA bundles", "5.1.1.0 x64"). Copies that were skipped (wrong
+  bitness) or failed to load are listed. The 64-bit run warns if it did *not* use NINA's DLL.
 - **Windows and driver files**:
   - Windows build (shows whether this is Windows 11).
   - Every `SBIGUDrv.dll` on the PC (System32, SysWOW64, NINA and CCDOps folders) with file version and 32/64-bit.
@@ -156,6 +161,18 @@ Notes:
 - Ctrl+C or closing the window stops the run at the next driver call, restores everything and closes the camera.
   While camera options are changed (a few seconds per experiment), further Ctrl+C presses are held back
   until they are restored. No new experiment starts after an interrupt.
+- If a restore fails, the run **stops** (no further experiment runs with a setting stuck) and says so first in the
+  observations; the exit code is then 5.
+- **Limits of cleanup:** a crash or hang inside the SBIG driver, a forced kill, or a power cut while a camera
+  option is changed can leave that option changed in the camera. sbigdiag writes a restore journal
+  (`%APPDATA%\sbigdiag\pending_restore.json`) before every camera-option change, and the next start of sbigdiag
+  (any mode) puts the options back. You can also set them by hand in CCDOps: Camera Setup -> Customer Options
+  (factory: overscan off, preflash off, Vdd-normally-off off).
+- A watchdog warns on the console if a driver call does not return for 60 s. Every call is written to
+  `driver_calls.log` *before* it is made, so a crash or hang shows which call it was in. A fatal crash
+  (including an access violation inside the SBIG DLL) is also written to `crash.txt`.
+- Windows is kept from going to sleep during the run (a suspended PC resets the USB link mid-readout,
+  which would look exactly like the camera fault).
 - `CC_READOUT_IN_PROGRESS` is never sent: in the shipped SBIG drivers its handler falls through into
   "set temperature regulation" and crashes (or switches the cooler off).
 

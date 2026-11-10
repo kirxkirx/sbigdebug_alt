@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
+	"syscall"
 )
 
 func sysInfo(out io.Writer) {
@@ -25,4 +27,20 @@ func flushConsoleInput()               {}
 func ansiPath(p string) (string, bool) { return p, true }
 func setDebugLogRegistry(string, [4]uint32) error {
 	return errors.New("only on Windows")
+}
+
+func preventSleep() bool { return false }
+func allowSleep()        {}
+
+func freeBytes(dir string) (uint64, bool) {
+	var st syscall.Statfs_t
+	if syscall.Statfs(dir, &st) != nil {
+		return 0, false
+	}
+	return st.Bavail * uint64(st.Bsize), true
+}
+
+func stdinIsConsole() bool {
+	st, err := os.Stdin.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
 }

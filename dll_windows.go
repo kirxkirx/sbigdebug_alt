@@ -3,7 +3,10 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,9 +21,33 @@ import (
 // (On Win64 there is only one calling convention; Go's syscall layer handles
 // stdcall on Win32.) All calls happen on the main OS thread (see main.go).
 type dllTransport struct {
-	dll  *syscall.DLL
-	proc *syscall.Proc
-	path string
+	dll   *syscall.DLL
+	proc  *syscall.Proc
+	path  string
+	notes []string // preferred candidates that were skipped or failed
+}
+
+// knownDLLs identifies vendor builds by SHA-256 (verified copies from Diffraction
+// Limited's downloads and NINA's installer).
+var knownDLLs = map[string]string{
+	"52d93d6a122967a3949fd7805b2c224813131f5011224aa6b7a114ba95aeaae1": "SBIGUDrv 4.99 Build 8 x64 (the copy NINA bundles in External\\x64\\SBIG)",
+	"9c35deff654413dbc3ea04ea6ee6664c0e01684ccc78d8d9c702a6ae72990eab": "SBIGUDrv 5.0.2.0 x64 (DL download)",
+	"c319e8246b864508ab9ea80de257c1200f6017d11159f76eb355edd1acc42fa8": "SBIGUDrv 5.1.1.0 x64 (DL download, newest)",
+	"de0e84e27721411853052008a7ee05928de029e34d692793fe3313df8d182d24": "SBIGUDrv 5.0.2.0 x86 (Driver Checker 64)",
+	"d3e29e82c3ee2345350c0f92306a7d62357cb8599e75f5a1230e89930bede404": "SBIGUDrv 4.99 Build 7 x86 (legacy bundle)",
+}
+
+func fileSHA256(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // processArch is the PE machine string our own process needs.
@@ -38,22 +65,29 @@ func processArch() string {
 // first and fail with "not a valid Win32 application" in a 64-bit process.
 func loadDriverDLL(path string) (transport, error) {
 	if path != "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
 		return loadOneDLL(path)
 	}
 	want := processArch()
-	var tried []string
+	var tried, notes []string
 	for _, p := range preferredDLLs() {
 		if m := peMachine(p); m != want {
+			notes = append(notes, fmt.Sprintf("skipped %s (%s; this exe is %s)", p, m, want))
 			continue
 		}
 		t, err := loadOneDLL(p)
 		if err == nil {
+			t.(*dllTransport).notes = notes
 			return t, nil
 		}
 		tried = append(tried, err.Error())
+		notes = append(notes, "failed "+err.Error())
 	}
 	t, err := loadOneDLL("SBIGUDrv.dll")
 	if err == nil {
+		t.(*dllTransport).notes = append(notes, "loaded by bare name through the Windows DLL search order")
 		return t, nil
 	}
 	tried = append(tried, err.Error())
@@ -132,17 +166,32 @@ func (t *dllTransport) Call(cmd uint16, params, results []byte) uint16 {
 func (t *dllTransport) Close() error { return t.dll.Release() }
 
 func (t *dllTransport) Describe() []string {
-	return []string{
-		"Driver DLL loaded : " + t.path,
-		"Driver DLL version: " + fileVersion(t.path),
-		"Driver DLL arch   : " + peMachine(t.path),
+	var out []string
+	for _, n := range t.notes {
+		out = append(out, "Driver DLL note   : "+n)
 	}
+	sum := fileSHA256(t.path)
+	known := knownDLLs[sum]
+	if known == "" {
+		known = "not one of the builds sbigdiag knows"
+	}
+	out = append(out,
+		"Driver DLL loaded : "+t.path,
+		"Driver DLL version: "+fileVersion(t.path),
+		"Driver DLL arch   : "+peMachine(t.path),
+		"Driver DLL sha256 : "+sum+" = "+known)
+	if runtime.GOARCH == "amd64" && !strings.Contains(strings.ToLower(t.path), "n.i.n.a") {
+		out = append(out,
+			"!!! This 64-bit run did NOT use NINA's own SBIGUDrv.dll (External\\x64\\SBIG). For the README's decisive",
+			"!!! test (step 3) point -dll at NINA's copy, e.g. -dll \"C:\\Program Files\\N.I.N.A. - Nighttime Imaging 'N' Astronomy\\External\\x64\\SBIG\\SBIGUDrv.dll\"")
+	}
+	return out
 }
 
 var (
 	modKernel32                 = syscall.NewLazyDLL("kernel32.dll")
 	procGetModuleFileNameW      = modKernel32.NewProc("GetModuleFileNameW")
-	modVersion                  = syscall.NewLazyDLL("version.dll")
+	modVersion                  = syscall.NewLazyDLL(systemDLLPath("version.dll"))
 	procGetFileVersionInfoSizeW = modVersion.NewProc("GetFileVersionInfoSizeW")
 	procGetFileVersionInfoW     = modVersion.NewProc("GetFileVersionInfoW")
 	procVerQueryValueW          = modVersion.NewProc("VerQueryValueW")
@@ -262,4 +311,15 @@ func peMachine(path string) string {
 		return "ARM64"
 	}
 	return fmt.Sprintf("machine 0x%x", le.Uint16(pe[4:]))
+}
+
+// systemDLLPath returns the absolute System32 path of a system DLL, so that a DLL
+// of the same name next to the exe (e.g. in Downloads) is never picked up.
+func systemDLLPath(name string) string {
+	buf := make([]uint16, 512)
+	n, _, _ := syscall.NewLazyDLL("kernel32.dll").NewProc("GetSystemDirectoryW").Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if n == 0 || int(n) >= len(buf) {
+		return name
+	}
+	return syscall.UTF16ToString(buf[:n]) + `\` + name
 }

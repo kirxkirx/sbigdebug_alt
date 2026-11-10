@@ -10,10 +10,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -78,6 +80,10 @@ func main() {
 
 func run(o options) int {
 	files := flag.Args()
+	if o.frames < 1 || o.frames > 100 || o.rest < 0 || o.rest > 3600 {
+		fmt.Println("-n must be 1..100 and -rest 0..3600")
+		return 2
+	}
 	interactive := !o.info && !o.quick && !o.full && o.custom == "" && len(files) == 0 && !o.analyze
 	fmt.Printf("sbigdiag %s (%s/%s) - SBIG STX/STXL diagnostic tool\n", version, runtime.GOOS, runtime.GOARCH)
 	if len(files) > 0 {
@@ -99,8 +105,15 @@ Close NINA / CCDOps / MaxIm (or disconnect the camera in them) before using opti
   5) Analyse existing FITS/XISF files (e.g. from NINA) - no camera needed
   6) Demo with a simulated faulty camera (no hardware needed)
   q) Quit`)
+		if !stdinIsConsole() {
+			fmt.Println("No interactive console: choose a mode with -info, -quick, -full or -custom (see -h).")
+			return 2
+		}
 		fmt.Print("Choice [3]: ")
-		line, _ := in.ReadString('\n')
+		line, err := in.ReadString('\n')
+		if err != nil && strings.TrimSpace(line) == "" {
+			return 0 // EOF: never start a camera run by default
+		}
 		switch strings.TrimSpace(strings.ToLower(line)) {
 		case "1":
 			o.info = true
@@ -128,8 +141,12 @@ Close NINA / CCDOps / MaxIm (or disconnect the camera in them) before using opti
 			return 0
 		}
 	}
+	interactiveRun = interactive
 	return runCamera(o)
 }
+
+// interactiveRun: the operator chose the mode in the menu (so a confirmation can be asked).
+var interactiveRun bool
 
 func askCustom(in *bufio.Reader) string {
 	ask := func(q, def string) string {
@@ -197,6 +214,12 @@ func parseCustom(s string) (ExposureSpec, error) {
 		}
 		k, v = strings.ToLower(strings.TrimSpace(k)), strings.TrimSpace(v)
 		fv, ferr := strconv.ParseFloat(v, 64)
+		if ferr == nil && (math.IsNaN(fv) || math.IsInf(fv, 0) || fv < 0) {
+			return spec, fmt.Errorf("bad value in %q", kv)
+		}
+		if k == "exp" && fv > 3600 {
+			return spec, fmt.Errorf("exp must be 0..3600 s")
+		}
 		iv := int(fv)
 		if k != "linedelay" && ferr != nil {
 			return spec, fmt.Errorf("bad value in %q", kv)
@@ -239,12 +262,20 @@ func parseCustom(s string) (ExposureSpec, error) {
 }
 
 func makeOutDir(o options) string {
+	name := "sbigdiag_" + time.Now().Format("20060102_150405")
 	if o.outDir != "" {
 		if err := os.MkdirAll(o.outDir, 0o755); err == nil {
-			return o.outDir
+			if ents, err := os.ReadDir(o.outDir); err == nil && len(ents) > 0 {
+				// never mix two runs in one folder: use a new subfolder
+				d := filepath.Join(o.outDir, name)
+				if err := os.MkdirAll(d, 0o755); err == nil {
+					return d
+				}
+			} else {
+				return o.outDir
+			}
 		}
 	}
-	name := "sbigdiag_" + time.Now().Format("20060102_150405")
 	var bases []string
 	if exe, err := os.Executable(); err == nil {
 		bases = append(bases, filepath.Dir(exe))
@@ -305,6 +336,25 @@ func runCamera(o options) (code int) {
 	}
 	_ = logf
 	fmt.Fprintf(out, "sbigdiag %s  started %s  output folder: %s\n", version, time.Now().Format("2006-01-02 15:04:05 MST"), dir)
+	fmt.Fprintf(out, "command line: %q\n", os.Args)
+	if dir != "" {
+		// Go fatal errors - including an access violation inside SBIGUDrv.dll - also go to crash.txt,
+		// so they survive a double-clicked window that closes.
+		if cf, err := os.Create(filepath.Join(dir, "crash.txt")); err == nil {
+			_ = debug.SetCrashOutput(cf, debug.CrashOptions{})
+			defer func() {
+				_ = debug.SetCrashOutput(nil, debug.CrashOptions{})
+				cf.Close()
+				if st, err := os.Stat(cf.Name()); err == nil && st.Size() == 0 {
+					os.Remove(cf.Name())
+				}
+			}()
+		}
+	}
+	if preventSleep() {
+		fmt.Fprintln(out, "Windows sleep is blocked while sbigdiag runs.")
+		defer allowSleep()
+	}
 	sysInfo(out)
 	regSnap := snapshotSBIGRegistry()
 	eventLog := "" // SBIG driver debug log file (camera events), set once enabled
@@ -325,8 +375,33 @@ func runCamera(o options) (code int) {
 		fmt.Fprintln(out, l)
 	}
 	cam := NewCamera(t, trace)
+	// Hang watchdog: it only reads cam.Busy() and never calls the driver itself.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		var warned int64
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-tick.C:
+				id, since := cam.Busy()
+				if id >= 0 && time.Since(since) > 60*time.Second && since.UnixNano() != warned {
+					warned = since.UnixNano()
+					msg := fmt.Sprintf("!!! driver call %s has not returned for %.0f s: the camera or the SBIG driver may be hung.\n"+
+						"!!! If nothing happens, close this window, power-cycle the camera and send the output folder\n"+
+						"!!! (driver_calls.log ends with the call that hung).", cmdName(uint16(id)), time.Since(since).Seconds())
+					fmt.Fprintln(out, msg)
+					cam.tracef("WATCHDOG %s", strings.ReplaceAll(msg, "\n", " "))
+				}
+			}
+		}
+	}()
 	s := &Session{cam: cam, out: out, dir: dir, device: o.device, ip: o.ip, saveFITS: !o.noFITS, restSec: o.rest,
-		origDCP: map[int]uint32{}, info: map[string]interface{}{"started": time.Now().Format(time.RFC3339)}}
+		origDCP: map[int]uint32{}, info: map[string]interface{}{"started": time.Now().Format(time.RFC3339),
+			"args": os.Args, "status": "running"}}
 
 	// Ctrl+C / window close: stop at the next safe point, restore settings, close the camera.
 	// While camera customer options (stored in the camera) are changed, further
@@ -355,10 +430,16 @@ func runCamera(o options) (code int) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(out, "\nINTERNAL ERROR: %v\n", r)
+			s.info["status"] = fmt.Sprint("internal-error: ", r)
 			code = 4
 		}
 		fmt.Fprintln(out, "\n== Restoring settings and closing ==")
-		if !s.RestoreAll() {
+		restored := s.RestoreAll()
+		if (!restored || s.halted.Load()) && code == 0 {
+			code = 5
+		}
+		s.info["finished"] = time.Now().Format(time.RFC3339)
+		if !restored {
 			fmt.Fprintln(out, "WARNING: some settings could not be restored - see above. Driver settings are per-process and")
 			fmt.Fprintln(out, "         vanish when this program exits; camera customer options are stored in the camera.")
 		} else {
@@ -382,8 +463,10 @@ func runCamera(o options) (code int) {
 
 	if err := s.Connect(); err != nil {
 		fmt.Fprintln(out, "ERROR:", err)
+		s.info["status"] = "connect-failed: " + err.Error()
 		return 3
 	}
+	s.RecoverJournal() // camera options left changed by an interrupted earlier run
 	// Camera event messages (e.g. "LV TE Off" = input voltage too low): the driver
 	// takes its debug-log settings only from HKCU\Software\SBIG\SBIGUDRV\DebugLog and
 	// only while a device is open. Write them, let the driver load them, and put the
@@ -434,13 +517,20 @@ func runCamera(o options) (code int) {
 			}
 		}
 	}
-	switch {
-	case o.custom != "":
-		spec, err := parseCustom(o.custom)
-		if err != nil {
+	var spec ExposureSpec
+	if o.custom != "" {
+		var err error
+		if spec, err = parseCustom(o.custom); err != nil {
 			fmt.Fprintln(out, "bad -custom:", err)
 			return 2
 		}
+	}
+	if !s.preflight(o, interactiveRun) {
+		s.info["status"] = "cancelled before the first exposure"
+		return 0
+	}
+	switch {
+	case o.custom != "":
 		if s.heading("custom series", o.custom+" "+o.sets) {
 			s.series("custom", spec, o.frames)
 			s.SampleOffsets("after custom series", 3)
@@ -449,6 +539,12 @@ func runCamera(o options) (code int) {
 		s.QuickTest(o.frames)
 	default:
 		s.FullTest()
+	}
+	if s.info["status"] == "running" {
+		s.info["status"] = "completed"
+		if s.aborted() {
+			s.info["status"] = "aborted by the operator"
+		}
 	}
 	s.PrintTable()
 	s.Interpret()
