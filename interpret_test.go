@@ -122,3 +122,61 @@ func TestInterpretExposureLengthUsesNeighbours(t *testing.T) {
 		t.Errorf("exposure-length verdict although the neighbouring bias frames are fine:\n%s", out)
 	}
 }
+
+func TestInterpretRelinkWithOneUsableFrameStillCredited(t *testing.T) {
+	relinkFrames := 0
+	out := runPlan(t, func(n int, exp string) string {
+		switch exp {
+		case "after-relink":
+			relinkFrames++
+			if relinkFrames < 2 {
+				return "ERROR" // first frame after the re-link failed
+			}
+			return "OK"
+		case "relink-autoadgain0", "after-rest", "final-bias", "final-dark5":
+			return "OK"
+		}
+		return "SATURATED"
+	})
+	if !strings.Contains(out, "after-relink: ALL 1 frame(s) GOOD right after this step") {
+		t.Errorf("re-link with one usable frame not credited:\n%s", out)
+	}
+	if !strings.Contains(out, "relink-autoadgain0: good (the camera was already recovered by 'after-relink')") {
+		t.Errorf("the later re-link step must not take the credit:\n%s", out)
+	}
+}
+
+func TestInterpretSingleFrameAfterRecoveryIsInconclusive(t *testing.T) {
+	out := runPlan(t, func(n int, exp string) string {
+		if n >= 8 { // the camera recovers on its own before bin3x3 (frames 10..)
+			return "OK"
+		}
+		return "SATURATED"
+	})
+	if strings.Contains(out, "bin3x3: 1 good frame") {
+		t.Errorf("single frame after a recovery must be inconclusive, not suggestive:\n%s", out)
+	}
+}
+
+func TestInterpretPartialWithoutEarlierFaultIsNotTransient(t *testing.T) {
+	seen := 0
+	out := runPlan(t, func(n int, exp string) string {
+		if exp == "bin2x2" {
+			seen++
+			if seen == 2 {
+				return "SATURATED"
+			}
+			return "OK"
+		}
+		if n > 12 {
+			return "SATURATED"
+		}
+		return "OK"
+	})
+	if strings.Contains(out, "transient") {
+		t.Errorf("'transient' claimed although the camera was fine before:\n%s", out)
+	}
+	if !strings.Contains(out, "bin2x2: 1 of 2 frame(s) faulty: OK -> SATURATED - the camera went bad during this experiment") {
+		t.Errorf("missing 'went bad during this experiment':\n%s", out)
+	}
+}

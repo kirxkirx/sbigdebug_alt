@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -341,9 +340,10 @@ func runCamera(o options) (code int) {
 		// Go fatal errors - including an access violation inside SBIGUDrv.dll - also go to crash.txt,
 		// so they survive a double-clicked window that closes.
 		if cf, err := os.Create(filepath.Join(dir, "crash.txt")); err == nil {
-			_ = debug.SetCrashOutput(cf, debug.CrashOptions{})
+			undo := redirectFatalOutput(cf)
+			fmt.Fprintln(out, "Fatal crash reports (Go or inside the SBIG DLL) go to crash.txt in the output folder.")
 			defer func() {
-				_ = debug.SetCrashOutput(nil, debug.CrashOptions{})
+				undo()
 				cf.Close()
 				if st, err := os.Stat(cf.Name()); err == nil && st.Size() == 0 {
 					os.Remove(cf.Name())
@@ -401,7 +401,7 @@ func runCamera(o options) (code int) {
 	}()
 	s := &Session{cam: cam, out: out, dir: dir, device: o.device, ip: o.ip, saveFITS: !o.noFITS, restSec: o.rest,
 		origDCP: map[int]uint32{}, info: map[string]interface{}{"started": time.Now().Format(time.RFC3339),
-			"args": os.Args, "status": "running"}}
+			"args": os.Args, "status": "running"}, simulated: o.sim || o.simHealthy}
 
 	// Ctrl+C / window close: stop at the next safe point, restore settings, close the camera.
 	// While camera customer options (stored in the camera) are changed, further
@@ -435,8 +435,21 @@ func runCamera(o options) (code int) {
 		}
 		fmt.Fprintln(out, "\n== Restoring settings and closing ==")
 		restored := s.RestoreAll()
-		if (!restored || s.halted.Load()) && code == 0 {
+		if (!restored || s.halted.Load() || s.info["journal"] == "recovery failed") && code == 0 {
 			code = 5
+		}
+		if st, _ := s.info["status"].(string); st == "running" {
+			switch {
+			case s.aborted():
+				s.info["status"] = "aborted by the operator"
+			case code == 0:
+				s.info["status"] = "completed"
+			default:
+				s.info["status"] = fmt.Sprintf("error (exit code %d)", code)
+			}
+		}
+		if !restored {
+			s.info["status"] = fmt.Sprint(s.info["status"], "; RESTORE FAILED")
 		}
 		s.info["finished"] = time.Now().Format(time.RFC3339)
 		if !restored {
@@ -466,7 +479,7 @@ func runCamera(o options) (code int) {
 		s.info["status"] = "connect-failed: " + err.Error()
 		return 3
 	}
-	s.RecoverJournal() // camera options left changed by an interrupted earlier run
+	s.RecoverJournal(interactiveRun && stdinIsConsole()) // camera options left changed by an interrupted earlier run
 	// Camera event messages (e.g. "LV TE Off" = input voltage too low): the driver
 	// takes its debug-log settings only from HKCU\Software\SBIG\SBIGUDRV\DebugLog and
 	// only while a device is open. Write them, let the driver load them, and put the
@@ -496,6 +509,18 @@ func runCamera(o options) (code int) {
 	if o.info || s.aborted() {
 		return 0
 	}
+	var spec ExposureSpec
+	if o.custom != "" {
+		var err error
+		if spec, err = parseCustom(o.custom); err != nil {
+			fmt.Fprintln(out, "bad -custom:", err)
+			return 2
+		}
+	}
+	if !s.preflight(o, interactiveRun) {
+		s.info["status"] = "cancelled before the first exposure"
+		return 0
+	}
 	// Temporary settings for quick/custom runs.
 	if o.sets != "" {
 		for _, kv := range strings.Split(o.sets, ",") {
@@ -517,18 +542,6 @@ func runCamera(o options) (code int) {
 			}
 		}
 	}
-	var spec ExposureSpec
-	if o.custom != "" {
-		var err error
-		if spec, err = parseCustom(o.custom); err != nil {
-			fmt.Fprintln(out, "bad -custom:", err)
-			return 2
-		}
-	}
-	if !s.preflight(o, interactiveRun) {
-		s.info["status"] = "cancelled before the first exposure"
-		return 0
-	}
 	switch {
 	case o.custom != "":
 		if s.heading("custom series", o.custom+" "+o.sets) {
@@ -539,12 +552,6 @@ func runCamera(o options) (code int) {
 		s.QuickTest(o.frames)
 	default:
 		s.FullTest()
-	}
-	if s.info["status"] == "running" {
-		s.info["status"] = "completed"
-		if s.aborted() {
-			s.info["status"] = "aborted by the operator"
-		}
 	}
 	s.PrintTable()
 	s.Interpret()

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 )
 
@@ -43,4 +44,10 @@ func freeBytes(dir string) (uint64, bool) {
 func stdinIsConsole() bool {
 	st, err := os.Stdin.Stat()
 	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
+// redirectFatalOutput: Go fatal errors also go to f (non-Windows: simulator only).
+func redirectFatalOutput(f *os.File) func() {
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
+	return func() { _ = debug.SetCrashOutput(nil, debug.CrashOptions{}) }
 }

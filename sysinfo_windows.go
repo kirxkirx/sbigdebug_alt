@@ -441,3 +441,20 @@ func stdinIsConsole() bool {
 	r, _, _ := procGetConsoleMode.Call(h, uintptr(unsafe.Pointer(&mode)))
 	return r != 0
 }
+
+var procSetStdHandle = modKernel32.NewProc("SetStdHandle")
+
+// redirectFatalOutput points the process's standard-error handle at f. The Go
+// runtime looks up STD_ERROR_HANDLE for every fatal write, so Go crashes AND an
+// access violation inside SBIGUDrv.dll (printed by the runtime's exception
+// handler) land in f, even when the double-clicked window closes. os.Stderr keeps
+// the console handle it captured at start-up.
+func redirectFatalOutput(f *os.File) func() {
+	const stdErr = ^uintptr(11) // STD_ERROR_HANDLE = (DWORD)-12
+	old, _, _ := procGetStdHandle.Call(uintptr(^uint32(11)))
+	if r, _, _ := procSetStdHandle.Call(uintptr(^uint32(11)), f.Fd()); r == 0 {
+		return func() {}
+	}
+	_ = stdErr
+	return func() { procSetStdHandle.Call(uintptr(^uint32(11)), old) }
+}

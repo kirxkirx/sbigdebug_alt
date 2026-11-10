@@ -165,12 +165,16 @@ Notes:
   observations; the exit code is then 5.
 - **Limits of cleanup:** a crash or hang inside the SBIG driver, a forced kill, or a power cut while a camera
   option is changed can leave that option changed in the camera. sbigdiag writes a restore journal
-  (`%APPDATA%\sbigdiag\pending_restore.json`) before every camera-option change, and the next start of sbigdiag
-  (any mode) puts the options back. You can also set them by hand in CCDOps: Camera Setup -> Customer Options
-  (factory: overscan off, preflash off, Vdd-normally-off off).
+  (`%APPDATA%\sbigdiag\pending_restore.json`, with the camera's serial number) before every camera-option
+  change. When sbigdiag is next started from the menu on the same camera, it shows the leftover values and
+  asks before restoring them. Otherwise it only reports them and skips camera-option experiments. A journal
+  older than 7 days, or one for another camera, is never applied; the demo never touches it. You can also set
+  the options by hand in CCDOps: Camera Setup -> Customer Options (factory: overscan off, preflash off,
+  Vdd-normally-off off).
 - A watchdog warns on the console if a driver call does not return for 60 s. Every call is written to
   `driver_calls.log` *before* it is made, so a crash or hang shows which call it was in. A fatal crash
-  (including an access violation inside the SBIG DLL) is also written to `crash.txt`.
+  (including an access violation inside the SBIG DLL) is written to `crash.txt`: sbigdiag points the
+  process's standard-error handle at that file.
 - Windows is kept from going to sleep during the run (a suspended PC resets the USB link mid-readout,
   which would look exactly like the camera fault).
 - `CC_READOUT_IN_PROGRESS` is never sent: in the shipped SBIG drivers its handler falls through into

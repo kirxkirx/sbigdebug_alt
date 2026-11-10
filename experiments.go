@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -583,16 +581,20 @@ func (s *Session) Interpret() {
 		prevBad := prev != nil && fault(prev)
 		nextBad := next != nil && fault(next)
 		switch {
-		case k == 0 && prevBad && len(rs) == 1:
-			s.pf("- %s: 1 good frame while the camera was faulty before (frame %d) - suggestive only, not confirmed (%s?)\n", exp, prev.N, what)
 		case k == 0 && prevBad && isResetting(exp):
 			// re-link / rest change the camera state for good: judge against the frame before only
 			if creditedReset == "" {
 				creditedReset = exp
-				s.pf("- %s: ALL %d frame(s) GOOD right after this step, while the camera was faulty before (frame %d) -> %s\n", exp, len(rs), prev.N, what)
+				hedge := ""
+				if len(rs) == 1 {
+					hedge = " (only 1 usable frame - suggestive)"
+				}
+				s.pf("- %s: ALL %d frame(s) GOOD right after this step, while the camera was faulty before (frame %d)%s -> %s\n", exp, len(rs), prev.N, hedge, what)
 			} else {
 				s.pf("- %s: good (the camera was already recovered by '%s')\n", exp, creditedReset)
 			}
+		case k == 0 && prevBad && len(rs) == 1 && (next == nil || nextBad):
+			s.pf("- %s: 1 good frame while the camera was faulty before (frame %d) - suggestive only, not confirmed (%s?)\n", exp, prev.N, what)
 		case k == 0 && prevBad && (next == nil || nextBad):
 			after := ""
 			if next != nil {
@@ -606,11 +608,19 @@ func (s *Session) Interpret() {
 		case k < len(rs):
 			var seq []string
 			for _, r := range rs {
-				seq = append(seq, r.Class)
+				c := r.Class
+				if exp == "light-min" && r.StrictClass != "" {
+					c = r.StrictClass // the class that was judged
+				}
+				seq = append(seq, c)
 			}
 			extra := ""
 			if !isFault(rs[0]) && isFault(rs[len(rs)-1]) {
-				extra = " - good right after the change, then faulty again (transient, like after power-on)"
+				if prevBad {
+					extra = " - good right after the change, then faulty again (transient, like after power-on)"
+				} else {
+					extra = " - the camera went bad during this experiment"
+				}
 			}
 			s.pf("- %s: %d of %d frame(s) faulty: %s%s\n", exp, k, len(rs), strings.Join(seq, " -> "), extra)
 		case prev != nil && !prevBad && next != nil && !nextBad:
@@ -711,7 +721,14 @@ func (s *Session) preflight(o options, interactive bool) bool {
 	s.pf("\n== Plan: %s, about %d frames, about %d min, about %.1f GB of files ==\n", what, frames, mins, float64(need)/1e9)
 	if what == "the FULL test" {
 		s.pl("  * Keep the telescope covered / the dome dark: the shutter opens for 2 short frames.")
-		s.pl("  * Driver settings and two camera options (vddNormallyOff, overscan) are changed briefly, one at a time,")
+		opts := "vddNormallyOff, overscan"
+		if o, err := s.cam.GetCustomerOptions(); err == nil && o.Preflash != 0 {
+			opts = "vddNormallyOff, overscan and preflashCcd (now ON - tested OFF)"
+		}
+		if s.journalBlock != "" {
+			opts = "none (" + s.journalBlock + ")"
+		}
+		s.pl("  * Driver settings and camera options (" + opts + ") are changed briefly, one at a time,")
 		s.pl("    and put back right after each experiment. Cooling, fan and filter wheel are not touched.")
 	}
 	if s.dir != "" && s.saveFITS {
@@ -723,12 +740,8 @@ func (s *Session) preflight(o options, interactive bool) bool {
 	if !interactive {
 		return true
 	}
-	flushConsoleInput()
-	fmt.Print("Start now? [Y/n]: ")
-	l, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	a := strings.ToLower(strings.TrimSpace(l))
-	if (err != nil && a == "") || a == "n" || a == "no" || a == "q" {
-		s.pl("Cancelled - nothing was changed.")
+	if !s.confirm("Start now?") {
+		s.pl("Cancelled before the first exposure.")
 		return false
 	}
 	return true

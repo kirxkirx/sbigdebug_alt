@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
@@ -41,6 +42,23 @@ type Session struct {
 	origOptsText atomic.Value
 	halted       atomic.Bool // a restore failed: no further experiment may run
 	haltReason   string
+	simulated    bool   // simulator transport: never touch the real restore journal
+	journalOwned bool   // this process wrote the pending journal
+	journalBlock string // non-empty: an earlier run's journal is unresolved - no camera-option experiments
+	camSerial    string
+	ask          func(question string) bool // nil: ask on the console (tests inject answers)
+}
+
+// confirm asks a yes/no question (default yes); EOF or "n" means no.
+func (s *Session) confirm(q string) bool {
+	if s.ask != nil {
+		return s.ask(q)
+	}
+	flushConsoleInput()
+	fmt.Print(q + " [Y/n]: ")
+	l, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	a := strings.ToLower(strings.TrimSpace(l))
+	return !((err != nil && a == "") || a == "n" || a == "no" || a == "q")
 }
 
 // halt stops the experiment sequence after a failed restore (continuing would run
@@ -327,6 +345,9 @@ func (s *Session) SetDCPTemp(i int, v uint32) error {
 		s.origDCP[i] = cur
 	}
 	if err := c.SetDCP(i, v); err != nil {
+		if rb, err2 := c.GetDCP(i); err2 == nil && rb == cur {
+			delete(s.origDCP, i) // the driver refused and nothing changed
+		}
 		return err
 	}
 	rb, err := c.GetDCP(i)
@@ -344,6 +365,9 @@ func (s *Session) SetOptionsTemp(o CustomerOptions) error {
 	if s.aborted() {
 		return errAborted
 	}
+	if s.journalBlock != "" {
+		return fmt.Errorf("skipped: %s", s.journalBlock)
+	}
 	cur, err := s.cam.GetCustomerOptions()
 	if err != nil {
 		return fmt.Errorf("cannot read customer options (%v) - not changing them", err)
@@ -352,11 +376,25 @@ func (s *Session) SetOptionsTemp(o CustomerOptions) error {
 		s.origOpts = &cur
 	}
 	s.origOptsText.Store(s.origOpts.String())
-	s.nvPending.Store(true)
-	if err := writeJournal(Journal{Original: *s.origOpts, ChangedTo: o, Time: time.Now().Format(time.RFC3339), Dir: s.dir}); err != nil {
-		s.pf("  (restore journal not written: %v)\n", err)
+	if !s.simulated {
+		if _, err := os.Stat(journalPath()); err == nil && !s.journalOwned {
+			s.origOpts = nil
+			return fmt.Errorf("skipped: a restore journal from another run exists (%s)", journalPath())
+		}
+		if err := writeJournal(Journal{Original: *s.origOpts, ChangedTo: o, Time: time.Now().Format(time.RFC3339),
+			Dir: s.dir, Serial: s.camSerial, CameraType: s.cam.CameraType}); err != nil {
+			s.pf("  (restore journal not written: %v)\n", err)
+		} else {
+			s.journalOwned = true
+		}
 	}
+	s.nvPending.Store(true)
 	if err := s.cam.SetCustomerOptions(o); err != nil {
+		if rb, err2 := s.cam.GetCustomerOptions(); err2 == nil && rb == *s.origOpts {
+			s.origOpts = nil // refused, nothing changed in the camera
+			s.nvPending.Store(false)
+			s.dropJournal()
+		}
 		return err
 	}
 	rb, err := s.cam.GetCustomerOptions()
@@ -392,6 +430,12 @@ func (s *Session) restoreDCP(i int) bool {
 	}
 	err := s.cam.SetDCP(i, v)
 	rb, err2 := s.cam.GetDCP(i)
+	if err2 == nil && rb == v {
+		if err != nil {
+			s.pf("  (%s: the write was refused but the value is the original %d)\n", dcpNames[i], v)
+		}
+		err = nil
+	}
 	if err != nil || err2 != nil || rb != v {
 		s.pf("  RESTORE FAILED for %s (want %d, got %d, err %v %v)\n", dcpNames[i], v, rb, err, err2)
 		return false
@@ -411,11 +455,11 @@ func (s *Session) restoreOptions() bool {
 	for try := 0; try < 3; try++ { // these live in the camera: try hard
 		err = s.cam.SetCustomerOptions(*s.origOpts)
 		rb, err2 = s.cam.GetCustomerOptions()
-		if err == nil && err2 == nil && rb == *s.origOpts {
+		if err2 == nil && rb == *s.origOpts { // verified by readback (even if the write reported an error)
 			s.pf("  restored customer options: %s\n", rb)
 			s.origOpts = nil
 			s.nvPending.Store(false)
-			removeJournal()
+			s.dropJournal()
 			return true
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -489,7 +533,12 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 		Dark:     f.Spec.Dark, LinesRead: f.LinesRead, StrictClass: strict.Class}
 	if f.TempAfter.Valid && f.TempAfter.Advanced {
 		ct, hs := f.TempAfter.CCDTemp, f.TempAfter.HeatsinkTemp
-		r.CCDTempC, r.HeatsinkC = &ct, &hs
+		if !math.IsNaN(ct) && !math.IsInf(ct, 0) {
+			r.CCDTempC = &ct
+		}
+		if !math.IsNaN(hs) && !math.IsInf(hs, 0) {
+			r.HeatsinkC = &hs
+		}
 	}
 	r.ComValid = f.LinkValid
 	if f.LinkValid {
@@ -570,10 +619,14 @@ func (s *Session) fitsCards(f *Frame, exp string, r *FrameResult) []fitsCard {
 		{"ROWORDER", "TOP-DOWN", "row 0 = first line returned by driver"},
 		{"SWCREATE", "sbigdiag " + version, ""},
 	}
-	if f.TempAfter.Valid && f.TempAfter.Advanced { // only real readings, never zeros for "unknown"
-		cards = append(cards, fitsCard{"CCD-TEMP", f.TempAfter.CCDTemp, "after readout [C]"},
-			fitsCard{"HSINK-T", f.TempAfter.HeatsinkTemp, "heatsink after readout [C]"},
-			fitsCard{"COOLPWR", f.TempAfter.CoolerPower, "cooler power [%]"})
+	if r.CCDTempC != nil { // only real readings, never zeros for "unknown"
+		cards = append(cards, fitsCard{"CCD-TEMP", *r.CCDTempC, "after readout [C]"})
+	}
+	if r.HeatsinkC != nil {
+		cards = append(cards, fitsCard{"HSINK-T", *r.HeatsinkC, "heatsink after readout [C]"})
+	}
+	if pw := f.TempAfter.CoolerPower; f.TempAfter.Valid && f.TempAfter.Advanced && !math.IsNaN(pw) && !math.IsInf(pw, 0) {
+		cards = append(cards, fitsCard{"COOLPWR", pw, "cooler power [%]"})
 	}
 	if r.ComValid {
 		cards = append(cards, fitsCard{"COMFAIL", int(r.ComFailed), "link comFailed increase"})
@@ -780,10 +833,20 @@ func pixelHash(p []uint16) string {
 // next start put it back.
 
 type Journal struct {
-	Original  CustomerOptions `json:"original"`
-	ChangedTo CustomerOptions `json:"changed_to"`
-	Time      string          `json:"time"`
-	Dir       string          `json:"run_dir"`
+	Original   CustomerOptions `json:"original"`
+	ChangedTo  CustomerOptions `json:"changed_to"`
+	Time       string          `json:"time"`
+	Dir        string          `json:"run_dir"`
+	Serial     string          `json:"camera_serial"`
+	CameraType uint16          `json:"camera_type"`
+}
+
+// dropJournal removes the journal only if this process wrote it.
+func (s *Session) dropJournal() {
+	if s.journalOwned {
+		removeJournal()
+		s.journalOwned = false
+	}
 }
 
 func journalPath() string {
@@ -824,9 +887,18 @@ func removeJournal() {
 	}
 }
 
-// RecoverJournal runs right after connecting: it restores camera options that an
-// earlier, interrupted sbigdiag run left changed.
-func (s *Session) RecoverJournal() {
+// RecoverJournal runs right after connecting. If an earlier, interrupted sbigdiag
+// run left camera options changed on THIS camera (same serial, recent journal), it
+// offers to put them back (interactive runs) or reports it and blocks further
+// camera-option experiments (other runs). It never acts for a different camera or
+// for the simulator.
+func (s *Session) RecoverJournal(interactive bool) {
+	if s.simulated {
+		return
+	}
+	if x, err := s.cam.CCDInfoExtended(); err == nil {
+		s.camSerial = x.Serial
+	}
 	p := journalPath()
 	if p == "" {
 		return
@@ -837,30 +909,66 @@ func (s *Session) RecoverJournal() {
 	}
 	var j Journal
 	if json.Unmarshal(b, &j) != nil {
-		s.pf("Restore journal %s is unreadable - removed.\n", p)
+		s.pf("Restore journal %s is unreadable - left in place; please delete it.\n", p)
+		s.journalBlock = "an unreadable restore journal exists"
+		return
+	}
+	if j.Serial != s.camSerial || j.CameraType != s.cam.CameraType {
+		s.pf("Restore journal %s belongs to another camera (serial %q, this camera %q) - left in place.\n", p, j.Serial, s.camSerial)
+		s.journalBlock = "a restore journal for another camera exists"
+		return
+	}
+	if t, err := time.Parse(time.RFC3339, j.Time); err != nil || time.Since(t) > 7*24*time.Hour {
+		s.pf("Restore journal from %s is older than 7 days - removed without changing the camera (options now: %s).\n", j.Time, s.optionsText())
 		removeJournal()
 		return
 	}
 	cur, err := s.cam.GetCustomerOptions()
 	if err != nil {
-		s.pf("Restore journal found (%s), but the camera options cannot be read (%v) - kept for the next run.\n", p, err)
+		s.pf("Restore journal found (%s), but the camera options cannot be read (%v) - kept.\n", p, err)
+		s.journalBlock = "an unresolved restore journal exists"
 		return
 	}
 	switch cur {
-	case j.ChangedTo:
-		s.pf("\n!!! An earlier sbigdiag run (%s) was interrupted while camera options were changed: %s\n", j.Time, cur)
-		if err := s.cam.SetCustomerOptions(j.Original); err == nil {
-			if rb, err := s.cam.GetCustomerOptions(); err == nil && rb == j.Original {
-				s.pf("!!! Restored them to the original values: %s\n", rb)
-				removeJournal()
-				return
-			}
-		}
-		s.pf("!!! Could not restore them - please set them in CCDOps (Camera Setup -> Customer Options): %s\n", j.Original)
 	case j.Original:
 		removeJournal() // already back to the original values
+		return
+	case j.ChangedTo:
 	default:
-		s.pf("Restore journal from %s: the camera options (%s) were changed since; left as they are.\n", j.Time, cur)
+		s.pf("Restore journal from %s: the camera options (%s) were changed since - left as they are; journal removed.\n", j.Time, cur)
 		removeJournal()
+		return
 	}
+	s.pf("\n!!! An earlier sbigdiag run (%s) was interrupted while camera options were changed.\n", j.Time)
+	s.pf("!!! now in the camera: %s\n!!! original values:   %s\n", cur, j.Original)
+	if !interactive {
+		s.pl("!!! Not changed automatically in this run; camera-option experiments are skipped. Run sbigdiag")
+		s.pl("!!! interactively to restore them, or set them in CCDOps (Camera Setup -> Customer Options).")
+		s.journalBlock = "an earlier run's camera options are not restored yet"
+		return
+	}
+	if !s.confirm("Restore the original camera options now?") {
+		s.journalBlock = "the operator kept the camera options of an interrupted run"
+		s.pl("Left unchanged; camera-option experiments are skipped in this run.")
+		return
+	}
+	for try := 0; try < 3; try++ {
+		_ = s.cam.SetCustomerOptions(j.Original) // judged by the readback below
+		if rb, err := s.cam.GetCustomerOptions(); err == nil && rb == j.Original {
+			s.pf("Restored the camera options: %s\n", rb)
+			removeJournal()
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.pf("!!! Could not restore them - please set them in CCDOps (Camera Setup -> Customer Options): %s\n", j.Original)
+	s.journalBlock = "restoring an earlier run's camera options failed"
+	s.info["journal"] = "recovery failed"
+}
+
+func (s *Session) optionsText() string {
+	if o, err := s.cam.GetCustomerOptions(); err == nil {
+		return o.String()
+	}
+	return "unreadable"
 }
