@@ -2,76 +2,119 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math"
-	"os"
-	"regexp"
 	"strconv"
 	"strings"
 )
 
-var (
-	reImage   = regexp.MustCompile(`(?s)<Image\s[^>]*>`)
-	reAttr    = regexp.MustCompile(`(\w+)="([^"]*)"`)
-	reFITSKey = regexp.MustCompile(`<FITSKeyword\s+name="([^"]*)"\s+value="([^"]*)"`)
-)
-
-// ReadXISF reads the first image of an uncompressed XISF 1.0 file (as written by
-// NINA/PixInsight with compression off) into uint16. Only the first channel is used.
+// ReadXISF reads an uncompressed monochrome XISF 1.0 image. Unsupported
+// channel layouts are rejected instead of being mistaken for monochrome pixels.
 func ReadXISF(path string) ([]uint16, int, int, map[string]string, error) {
-	f, err := os.Open(path)
+	f, err := openImageFile(path)
 	if err != nil {
 		return nil, 0, 0, nil, err
 	}
 	defer f.Close()
+	fail := func(e error) ([]uint16, int, int, map[string]string, error) { return nil, 0, 0, nil, e }
+	st, err := f.Stat()
+	if err != nil {
+		return fail(err)
+	}
 	pre := make([]byte, 16)
 	if _, err := io.ReadFull(f, pre); err != nil || string(pre[:8]) != "XISF0100" {
-		return nil, 0, 0, nil, fmt.Errorf("not an XISF 1.0 file")
+		return fail(fmt.Errorf("not an XISF 1.0 file"))
 	}
-	hlen := binary.LittleEndian.Uint32(pre[8:])
-	if hlen > 64<<20 {
-		return nil, 0, 0, nil, fmt.Errorf("XISF header too large")
+	hlen := int64(binary.LittleEndian.Uint32(pre[8:]))
+	if hlen <= 0 || hlen > 4<<20 || hlen > st.Size()-16 {
+		return fail(fmt.Errorf("invalid or excessive XISF header size"))
 	}
-	xml := make([]byte, hlen)
-	if _, err := io.ReadFull(f, xml); err != nil {
-		return nil, 0, 0, nil, err
+	header := make([]byte, int(hlen))
+	if _, err = io.ReadFull(f, header); err != nil {
+		return fail(err)
 	}
-	img := reImage.Find(xml)
-	if img == nil {
-		return nil, 0, 0, nil, fmt.Errorf("no <Image> in XISF header")
+	type keyword struct {
+		Name  string `xml:"name,attr"`
+		Value string `xml:"value,attr"`
 	}
+	type imageHeader struct {
+		Attrs    []xml.Attr `xml:",any,attr"`
+		Keywords []keyword  `xml:"FITSKeyword"`
+	}
+	var doc struct {
+		XMLName xml.Name      `xml:"xisf"`
+		Version string        `xml:"version,attr"`
+		Images  []imageHeader `xml:"Image"`
+	}
+	if err = xml.Unmarshal(header, &doc); err != nil {
+		return fail(fmt.Errorf("XISF XML: %w", err))
+	}
+	if doc.Version != "1.0" || len(doc.Images) == 0 {
+		return fail(fmt.Errorf("missing XISF 1.0 image"))
+	}
+	img := doc.Images[0]
 	attr := map[string]string{}
-	for _, m := range reAttr.FindAllSubmatch(img, -1) {
-		attr[string(m[1])] = string(m[2])
+	for _, a := range img.Attrs {
+		if _, exists := attr[a.Name.Local]; exists {
+			return fail(fmt.Errorf("duplicate XISF attribute %s", a.Name.Local))
+		}
+		attr[a.Name.Local] = a.Value
 	}
 	if attr["compression"] != "" {
-		return nil, 0, 0, nil, fmt.Errorf("compressed XISF (%s) not supported - save uncompressed or FITS", attr["compression"])
+		return fail(fmt.Errorf("compressed XISF unsupported; save uncompressed or FITS"))
 	}
 	geo := strings.Split(attr["geometry"], ":")
 	loc := strings.Split(attr["location"], ":")
-	if len(geo) < 2 || len(loc) != 3 || loc[0] != "attachment" {
-		return nil, 0, 0, nil, fmt.Errorf("unsupported XISF geometry/location %q %q", attr["geometry"], attr["location"])
+	if len(geo) != 3 || geo[2] != "1" || len(loc) != 3 || loc[0] != "attachment" {
+		return fail(fmt.Errorf("only 2-D monochrome attached XISF images are supported"))
 	}
-	w, _ := strconv.Atoi(geo[0])
-	h, _ := strconv.Atoi(geo[1])
-	pos, _ := strconv.ParseInt(loc[1], 10, 64)
-	bpp := map[string]int{"UInt8": 1, "UInt16": 2, "UInt32": 4, "Float32": 4, "Float64": 8}[attr["sampleFormat"]]
-	if w <= 0 || h <= 0 || bpp == 0 {
-		return nil, 0, 0, nil, fmt.Errorf("unsupported XISF image %q %q", attr["geometry"], attr["sampleFormat"])
+	if p := attr["pixelStorage"]; p != "" && p != "Planar" && p != "Normal" {
+		return fail(fmt.Errorf("unknown XISF pixelStorage %q", p))
 	}
-	raw := make([]byte, w*h*bpp)
-	if _, err := f.ReadAt(raw, pos); err != nil {
-		return nil, 0, 0, nil, err
+	if c := attr["colorSpace"]; c != "" && c != "Gray" {
+		return fail(fmt.Errorf("only grayscale XISF is supported"))
 	}
-	big := attr["byteOrder"] == "big"
+	w, e := strconv.ParseInt(geo[0], 10, 64)
+	if e != nil {
+		return fail(e)
+	}
+	h, e := strconv.ParseInt(geo[1], 10, 64)
+	if e != nil {
+		return fail(e)
+	}
+	bpp := map[string]int64{"UInt8": 1, "UInt16": 2, "UInt32": 4, "Float32": 4, "Float64": 8}[attr["sampleFormat"]]
+	n, e := imageSize(w, h, bpp)
+	if e != nil {
+		return fail(e)
+	}
+	pos, e := strconv.ParseInt(loc[1], 10, 64)
+	if e != nil {
+		return fail(e)
+	}
+	length, e := strconv.ParseInt(loc[2], 10, 64)
+	if e != nil {
+		return fail(e)
+	}
+	if pos < 16+hlen || pos > st.Size() || length != int64(n)*bpp || length > st.Size()-pos {
+		return fail(fmt.Errorf("invalid or truncated XISF attachment"))
+	}
 	var bo binary.ByteOrder = binary.LittleEndian
-	if big {
+	switch attr["byteOrder"] {
+	case "", "little":
+	case "big":
 		bo = binary.BigEndian
+	default:
+		return fail(fmt.Errorf("unknown XISF byte order"))
 	}
-	pix := make([]uint16, w*h)
+	raw := make([]byte, int(length))
+	if _, e = f.ReadAt(raw, pos); e != nil {
+		return fail(e)
+	}
+	pix := make([]uint16, n)
 	for i := range pix {
-		b := raw[i*bpp:]
+		b := raw[i*int(bpp):]
 		var v float64
 		switch attr["sampleFormat"] {
 		case "UInt8":
@@ -85,18 +128,24 @@ func ReadXISF(path string) ([]uint16, int, int, map[string]string, error) {
 		case "Float64":
 			v = math.Float64frombits(bo.Uint64(b)) * 65535
 		}
-		pix[i] = clamp16(v + 0.5)
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 65535 {
+			return fail(fmt.Errorf("XISF sample %d outside finite normalized range; refusing clipping", i))
+		}
+		pix[i] = uint16(math.Round(v))
 	}
 	hdr := map[string]string{}
-	for _, m := range reFITSKey.FindAllSubmatch(xml, -1) {
-		hdr[string(m[1])] = strings.Trim(strings.TrimSpace(string(m[2])), "'")
+	for _, k := range img.Keywords {
+		hdr[k.Name] = strings.Trim(strings.TrimSpace(k.Value), "'")
 	}
-	return pix, w, h, hdr, nil
+	if attr["sampleFormat"] != "UInt16" {
+		hdr["SBIGDIAG_CONVERSION"] = "XISF " + attr["sampleFormat"] + " scaled to 0..65535 and rounded"
+	}
+	return pix, int(w), int(h), hdr, nil
 }
 
 // ReadImage dispatches on the file signature.
 func ReadImage(path string) ([]uint16, int, int, map[string]string, error) {
-	f, err := os.Open(path)
+	f, err := openImageFile(path)
 	if err != nil {
 		return nil, 0, 0, nil, err
 	}

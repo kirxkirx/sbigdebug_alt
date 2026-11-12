@@ -363,7 +363,7 @@ func (a *Analysis) bitAnalysis(pix []uint16) {
 func (a *Analysis) classify() {
 	s := a.Stats
 	switch {
-	case s.SatFrac >= 0.5 || s.Median >= 50000:
+	case s.SatFrac >= 0.5:
 		a.Class = "SATURATED"
 	case s.Median < 5 && s.Max < 50:
 		a.Class = "ZERO"
@@ -375,10 +375,10 @@ func (a *Analysis) classify() {
 		a.Class = "OK"
 	}
 	if len(a.StuckBits) > 0 {
-		a.Notes = append(a.Notes, "stuck A/D bits: "+strings.Join(a.StuckBits, ", ")+" -> digital data path / A-D converter problem")
+		a.Notes = append(a.Notes, "unusual bit occupancy: "+strings.Join(a.StuckBits, ", ")+"; inspect raw samples before attributing this to the ADC or data path")
 	}
 	if a.DupRows > a.H/20 && a.H > 20 {
-		a.Notes = append(a.Notes, fmt.Sprintf("%d rows are exact copies of the previous row -> data transfer/buffer problem", a.DupRows))
+		a.Notes = append(a.Notes, fmt.Sprintf("%d rows are exact copies of the previous row; clipping and uniform data can also cause identical rows", a.DupRows))
 	}
 	if d := math.Abs(a.LeftMedian - a.RightMedian); d > math.Max(200, 10*s.RobustSigma) && a.W > 100 {
 		a.Notes = append(a.Notes, fmt.Sprintf("left/right halves differ by %.0f ADU (dual-output CCD channel mismatch?)", d))
@@ -510,4 +510,22 @@ func (a *Analysis) ApplyDarkRules() {
 	if a.DeviantRows > 0 {
 		a.Notes = append(a.Notes, fmt.Sprintf("%d rows deviate by >500 ADU from the frame median (first: row %d)", a.DeviantRows, a.FirstDeviant))
 	}
+}
+
+// AnalyzeFrame is the common live/offline path; dark rules require explicit
+// closed-shutter metadata rather than guessing from exposure length or pixels.
+func AnalyzeFrame(pix []uint16, w, h int, dark bool) *Analysis {
+	a := Analyze(pix, w, h)
+	if dark {
+		a.ApplyDarkRules()
+	}
+	return a
+}
+
+func darkImageType(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "dark", "dark frame", "bias", "bias frame":
+		return true
+	}
+	return false
 }

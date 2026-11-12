@@ -50,7 +50,7 @@ func withData(rs []*FrameResult) []*FrameResult {
 // series takes n frames of one spec and returns them.
 func (s *Session) series(exp string, spec ExposureSpec, n int) []*FrameResult {
 	var out []*FrameResult
-	for k := 0; k < n && !s.aborted(); k++ {
+	for k := 0; k < n && !s.aborted() && !s.halted.Load(); k++ {
 		if r := s.TakeFrame(exp, spec); r != nil {
 			out = append(out, r)
 		}
@@ -61,7 +61,7 @@ func (s *Session) series(exp string, spec ExposureSpec, n int) []*FrameResult {
 // withDCP runs fn with one driver control parameter temporarily changed, then
 // restores exactly that parameter (and verifies it).
 func (s *Session) withDCP(i int, v uint32, fn func()) {
-	if s.aborted() {
+	if s.aborted() || s.halted.Load() {
 		return
 	}
 	cur, err := s.cam.GetDCP(i)
@@ -89,7 +89,7 @@ func (s *Session) withDCP(i int, v uint32, fn func()) {
 // withOptions runs fn with the camera customer options (stored IN the camera)
 // temporarily changed; they are restored and verified immediately afterwards.
 func (s *Session) withOptions(o CustomerOptions, fn func()) {
-	if s.aborted() {
+	if s.aborted() || s.halted.Load() {
 		return
 	}
 	defer func() {
@@ -123,7 +123,7 @@ func (s *Session) QuickTest(n int) {
 		"SBIG sets the black level at the factory to ~900-1000 ADU, so a healthy bias frame has a median near that.") {
 		return
 	}
-	for k := 0; k < n && !s.aborted(); k++ {
+	for k := 0; k < n && !s.aborted() && !s.halted.Load(); k++ {
 		s.TakeFrame("baseline-bias", bias(0))
 		s.SampleOffsets(fmt.Sprintf("after baseline frame %d", k+1), 1)
 	}
@@ -199,6 +199,9 @@ func (s *Session) FullTest() {
 	}
 	s.withDCP(DCP_AUTO_AD_GAIN, 0, func() { s.series("autoadgain0-bias", bias(0), 3) })
 
+	if s.aborted() || s.halted.Load() {
+		return
+	}
 	if v, err := s.cam.GetDCP(DCP_PIXEL_PIPELINE_ENABLE); err == nil && v != 0 {
 		if !s.heading("DCP_PIXEL_PIPELINE_ENABLE = 0", "Disables the driver's pixel pipelining (data path test).") {
 			return
@@ -217,6 +220,9 @@ func (s *Session) FullTest() {
 		}
 		s.series("overscan-bias", bias(0), 1)
 	})
+	if s.aborted() || s.halted.Load() {
+		return
+	}
 	s.cam.CCDInfo(0) // refresh geometry after restore
 
 	// Any other parameter that differs from its documented default.
@@ -243,6 +249,9 @@ func (s *Session) FullTest() {
 		s.withDCP(ii, uint32(dd), func() { s.series(fmt.Sprintf("default-%s", strings.TrimPrefix(dcpNames[ii], "DCP_")), bias(0), 2) })
 	}
 
+	if s.aborted() || s.halted.Load() {
+		return
+	}
 	if o, err := s.cam.GetCustomerOptions(); err == nil && o.VddNormallyOff == 0 {
 		if !s.heading("camera option vddNormallyOff = 1", "Turns the CCD output-amplifier supply (Vdd) fully OFF between exposures, "+
 			"which resets the output amplifier before every frame. Stored in the camera - restored right after.") {
@@ -254,6 +263,9 @@ func (s *Session) FullTest() {
 			s.series("vddoff-bias", bias(0), 3)
 			s.series("vddoff-dark5", dark(5), 2)
 		})
+	}
+	if s.aborted() || s.halted.Load() {
+		return
 	}
 	if o, err := s.cam.GetCustomerOptions(); err == nil && o.Overscan == 0 {
 		if !s.heading("camera option overscanRegions = 1", "Camera-side overscan (pixels that never held charge). "+
@@ -268,6 +280,9 @@ func (s *Session) FullTest() {
 			}
 			s.series("custoverscan-bias", bias(0), 1)
 		})
+		if s.aborted() || s.halted.Load() {
+			return
+		}
 		s.cam.CCDInfo(0)
 	}
 	if o, err := s.cam.GetCustomerOptions(); err == nil && (o.Preflash != 0 || o.VddNormallyOff != 0) {

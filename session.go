@@ -40,7 +40,7 @@ type Session struct {
 	// from their original values; the signal handler then refuses to os.Exit.
 	nvPending    atomic.Bool
 	origOptsText atomic.Value
-	halted       atomic.Bool // a restore failed: no further experiment may run
+	halted       atomic.Bool // cleanup or restoration failed: no further experiment may run
 	haltReason   string
 	simulated    bool   // simulator transport: never touch the real restore journal
 	journalOwned bool   // this process wrote the pending journal
@@ -61,8 +61,8 @@ func (s *Session) confirm(q string) bool {
 	return !((err != nil && a == "") || a == "n" || a == "no" || a == "q")
 }
 
-// halt stops the experiment sequence after a failed restore (continuing would run
-// every later experiment with a setting stuck at its test value).
+// halt stops the experiment sequence when cleanup or restoration leaves the
+// camera state uncertain. Restoration itself remains allowed.
 func (s *Session) halt(reason string) {
 	if s.halted.CompareAndSwap(false, true) {
 		s.haltReason = reason
@@ -310,7 +310,7 @@ func shortErr(err error) string {
 
 // SampleOffsets reads the camera's own bias measurement (CC_READ_OFFSET2) n times.
 func (s *Session) SampleOffsets(label string, n int) {
-	if s.aborted() {
+	if s.aborted() || s.halted.Load() {
 		return
 	}
 	var vals []string
@@ -336,16 +336,23 @@ func (s *Session) SampleOffsets(label string, n int) {
 // --- temporary settings with guaranteed restore ---
 
 func (s *Session) SetDCPTemp(i int, v uint32) error {
+	if s.aborted() {
+		return errAborted
+	}
+	if s.halted.Load() {
+		return fmt.Errorf("run halted: %s", s.haltReason)
+	}
 	c := s.cam
 	cur, err := c.GetDCP(i)
 	if err != nil {
 		return fmt.Errorf("cannot read %s before changing it (%v) - not changing it", dcpNames[i], err)
 	}
-	if _, saved := s.origDCP[i]; !saved {
+	_, saved := s.origDCP[i]
+	if !saved {
 		s.origDCP[i] = cur
 	}
 	if err := c.SetDCP(i, v); err != nil {
-		if rb, err2 := c.GetDCP(i); err2 == nil && rb == cur {
+		if rb, err2 := c.GetDCP(i); !saved && err2 == nil && rb == cur {
 			delete(s.origDCP, i) // the driver refused and nothing changed
 		}
 		return err
@@ -365,29 +372,38 @@ func (s *Session) SetOptionsTemp(o CustomerOptions) error {
 	if s.aborted() {
 		return errAborted
 	}
+	if s.halted.Load() {
+		return fmt.Errorf("run halted: %s", s.haltReason)
+	}
 	if s.journalBlock != "" {
 		return fmt.Errorf("skipped: %s", s.journalBlock)
+	}
+	if !s.simulated && strings.TrimSpace(s.camSerial) == "" {
+		return errors.New("cannot change persistent camera options without a verified camera serial")
 	}
 	cur, err := s.cam.GetCustomerOptions()
 	if err != nil {
 		return fmt.Errorf("cannot read customer options (%v) - not changing them", err)
 	}
-	if s.origOpts == nil {
-		s.origOpts = &cur
+	original := cur
+	if s.origOpts != nil {
+		original = *s.origOpts
 	}
-	s.origOptsText.Store(s.origOpts.String())
 	if !s.simulated {
-		if _, err := os.Stat(journalPath()); err == nil && !s.journalOwned {
-			s.origOpts = nil
-			return fmt.Errorf("skipped: a restore journal from another run exists (%s)", journalPath())
+		if _, err := os.Stat(journalPath()); !s.journalOwned && !os.IsNotExist(err) {
+			return fmt.Errorf("skipped: cannot claim restore journal %s (exists or cannot be inspected: %v)", journalPath(), err)
 		}
-		if err := writeJournal(Journal{Original: *s.origOpts, ChangedTo: o, Time: time.Now().Format(time.RFC3339),
+		if err := writeJournal(Journal{Original: original, ChangedTo: o, Time: time.Now().Format(time.RFC3339),
 			Dir: s.dir, Serial: s.camSerial, CameraType: s.cam.CameraType}); err != nil {
-			s.pf("  (restore journal not written: %v)\n", err)
+			return fmt.Errorf("persistent options unchanged: recovery journal could not be saved: %w", err)
 		} else {
 			s.journalOwned = true
 		}
 	}
+	if s.origOpts == nil {
+		s.origOpts = &original
+	}
+	s.origOptsText.Store(s.origOpts.String())
 	s.nvPending.Store(true)
 	if err := s.cam.SetCustomerOptions(o); err != nil {
 		if rb, err2 := s.cam.GetCustomerOptions(); err2 == nil && rb == *s.origOpts {
@@ -472,17 +488,24 @@ func (s *Session) restoreOptions() bool {
 // --- exposures ---
 
 func (s *Session) TakeFrame(exp string, spec ExposureSpec) *FrameResult {
-	if s.aborted() {
+	if s.aborted() || s.halted.Load() {
 		return nil
 	}
 	s.nframe++
 	n := s.nframe
 	s.pf("\n--- frame %d [%s] %s ---\n", n, exp, spec.Describe())
 	f, err := s.cam.Expose(spec, s.aborted)
+	if errors.Is(err, errCameraState) {
+		s.halt(err.Error())
+	}
 	if errors.Is(err, errAborted) {
 		// Do nothing slow here: restoring settings and closing must start at once.
 		s.pl("  frame aborted")
 		r := &FrameResult{N: n, Experiment: exp, Spec: spec.Describe(), Time: time.Now().Format(time.RFC3339), Class: "ABORTED", Dark: spec.Dark}
+		if errors.Is(err, errCameraState) {
+			r.Class, r.StrictClass = "ERROR", "ERROR"
+			r.Errors, r.FatalErr = []string{err.Error()}, err.Error()
+		}
 		s.results = append(s.results, r)
 		return r
 	}
@@ -497,6 +520,7 @@ func (s *Session) TakeFrame(exp string, spec ExposureSpec) *FrameResult {
 		f.Errors = append(f.Errors, err.Error())
 		s.pf("  readout error: %v (analysing the %d lines that were read)\n", err, f.LinesRead)
 	}
+	f.StateUncertain = errors.Is(err, errCameraState)
 	r := s.analyseFrame(n, exp, f)
 	if err != nil {
 		r.FatalErr = err.Error()
@@ -511,10 +535,7 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 		f.H = f.LinesRead // analyse and save only what was read
 		f.Pix = f.Pix[:f.W*f.H]
 	}
-	a := Analyze(f.Pix, f.W, f.H)
-	if f.Spec.Dark {
-		a.ApplyDarkRules()
-	}
+	a := AnalyzeFrame(f.Pix, f.W, f.H, f.Spec.Dark)
 	strict := *a // the same frame judged by the closed-shutter (bias) rules
 	strict.Notes = nil
 	if !f.Spec.Dark {
@@ -523,6 +544,10 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 	if partial {
 		a.Class = "PARTIAL"
 		strict.Class = "PARTIAL"
+	}
+	if f.StateUncertain {
+		a.Class, strict.Class = "ERROR", "ERROR"
+		a.Notes = append(a.Notes, "Acquisition cleanup failed; retained pixels are diagnostic evidence, not a successful frame.")
 	}
 	r := &FrameResult{N: n, Experiment: exp, Spec: f.Spec.Describe(), Time: f.Start.Format(time.RFC3339),
 		Class: a.Class, W: f.W, H: f.H, Stats: a.Stats, Boundaries: a.Boundaries, Segments: a.Segments,
@@ -556,6 +581,9 @@ func (s *Session) analyseFrame(n int, exp string, f *Frame) *FrameResult {
 	// DCP snapshot for the record
 	r.DCPs = map[string]uint32{}
 	for _, i := range []int{DCP_VDD_OPTIMIZED, DCP_HIGH_THROUGHPUT, DCP_USB_FIFO_ENABLE, DCP_VERT_FLUSH_CONTROL_ENABLE, DCP_OVERSCAN_ROWSCOLS, DCP_AUTO_AD_GAIN} {
+		if f.StateUncertain {
+			break // Do not issue more diagnostic commands after failed cleanup.
+		}
 		if v, err := s.cam.GetDCP(i); err == nil {
 			r.DCPs[dcpNames[i]] = v
 		}
@@ -618,6 +646,7 @@ func (s *Session) fitsCards(f *Frame, exp string, r *FrameResult) []fitsCard {
 		{"SBIGSPEC", f.Spec.Describe(), ""},
 		{"ROWORDER", "TOP-DOWN", "row 0 = first line returned by driver"},
 		{"SWCREATE", "sbigdiag " + version, ""},
+		{"SBIGCLAS", r.Class, "diagnostic classification; ERROR means failed acquisition"},
 	}
 	if r.CCDTempC != nil { // only real readings, never zeros for "unknown"
 		cards = append(cards, fitsCard{"CCD-TEMP", *r.CCDTempC, "after readout [C]"})
@@ -866,10 +895,11 @@ func writeJournal(j Journal) error {
 		return err
 	}
 	b, _ := json.MarshalIndent(j, "", " ")
-	f, err := os.Create(p)
+	f, err := os.CreateTemp(filepath.Dir(p), ".pending-restore-*")
 	if err != nil {
 		return err
 	}
+	defer os.Remove(f.Name())
 	if _, err := f.Write(b); err != nil {
 		f.Close()
 		return err
@@ -878,7 +908,10 @@ func writeJournal(j Journal) error {
 		f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), p)
 }
 
 func removeJournal() {
@@ -911,6 +944,11 @@ func (s *Session) RecoverJournal(interactive bool) {
 	if json.Unmarshal(b, &j) != nil {
 		s.pf("Restore journal %s is unreadable - left in place; please delete it.\n", p)
 		s.journalBlock = "an unreadable restore journal exists"
+		return
+	}
+	if strings.TrimSpace(j.Serial) == "" || strings.TrimSpace(s.camSerial) == "" {
+		s.journalBlock = "camera identity is unknown; inspect the recovery journal manually"
+		s.pf("Restore journal %s kept: %s.\n", p, s.journalBlock)
 		return
 	}
 	if j.Serial != s.camSerial || j.CameraType != s.cam.CameraType {

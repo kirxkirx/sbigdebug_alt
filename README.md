@@ -13,33 +13,34 @@ image turns bright above a sharp horizontal boundary. Every frame after that is
 almost fully saturated (bias frame means 10 429 → 57 213 → 56 564 ADU). A power
 cycle does not cure it, and CCDOps behaves the same as NINA.
 
-## The test that decides it (needs one power cycle)
+## Comparing driver and application behavior
 
-Three explanations fit everything seen so far. One test separates them.
+Driver versions, camera state, application sequencing, and intermittent hardware
+faults are all plausible leads. A good run followed by a bad run does not uniquely
+identify the cause.
 
-| Suspect | Why it fits | How to fix it |
-|---|---|---|
-| **NINA 3.2's SBIG driver code** | NINA 3.2 can send a temperature query to the SBIG driver while a frame is being read out; the driver is not thread-safe. The fix is in NINA 3.3 nightly ("Fixed missing synchronization in native … SBIG … SDK calls", commit `f475c75d9f`). A garbled command can leave the camera bad until it is power-cycled, which is why CCDOps also failed when run without a power cycle. | Update NINA to 3.3 (nightly), or use the SBIG ASCOM driver |
-| **NINA's bundled old driver DLL** | NINA loads its own x64 `SBIGUDrv.dll` 4.99 Build 8 from `External\x64\SBIG`. Diffraction Limited forum cases (STXL-11002 2016, STT-8300 2017, STX-16803 2022) had saturated bias/darks from **RBI-preflash handling with driver and firmware out of step**. In two of them, once MaxIm had connected, CCDOps stayed bad until a power cycle. | Put DL's x64 `SBIGUDrv.dll` 5.1.1.0 into NINA's `External\x64\SBIG` folder |
-| **Camera hardware** | DL calls the internal power module "the most common failure in these old cameras". An STXL failed only below 0 °C (frost in the chamber was suspected). The supply must deliver 12–13 V at ≥ 10 A. | Supply/cable, desiccant, or repair (DL no longer repairs STXL since Aug 2026) |
+1. Close other camera applications and run option **2** to collect repeated bias
+   frames. Keep the report, including the exact DLL path, architecture, version,
+   hash, settings, temperatures, and acquisition order.
+2. To compare installed DLLs, select each copy explicitly with `-dll <path>` and
+   use the executable matching its architecture. The 32-bit and 64-bit defaults
+   can select different DLLs; check the report rather than assuming which was used.
+3. Repeat matched exposures and settings, and reverse the comparison order when
+   practical. A difference that repeats is useful evidence, but architecture,
+   driver version, warming, and inherited camera state can still be confounded.
+4. Compare with NINA using the same exposure/settings and record when each program
+   connected. Use option **3** for further experiments; it changes settings and
+   briefly opens the shutter, so read its plan first.
 
-**Protocol:**
+NINA has a documented [SBIG synchronization fix](https://github.com/isbeorn/nina/commit/f475c75d9ff61f29e52838da24ee006e644f8e09)
+that extends locking across readout and temperature operations. It is a software
+lead, not proof that it explains these frames. Individual driver calls already
+had locking before that change.
 
-1. Close NINA so that it does not reconnect, then power-cycle the camera. While you are there,
-   look at the **voltage LEDs** on the side of the camera: only green should be lit. The 10V LED
-   means the cooler is shut off; the red 9V LED means operation is unreliable.
-2. Back at the PC, run **`sbigdiag-win32.exe`**, option **2**. It uses the same 32-bit system DLL as CCDOps.
-   - Bad frames → hardware, or a camera state that does not come from NINA. Run option 3 and send the folder.
-3. If step 2 was good, run **`sbigdiag-win64.exe`**, option **2**. It uses NINA's own DLL.
-   - Bad frames → NINA's old DLL is the cause (see the table for the fix).
-   - Good frames → NINA 3.2's unsynchronised calls are the cause (see the table for the fix).
-4. Confirm by imaging in NINA as usual. If it breaks again, the camera needs another power cycle.
-
-The report says which DLL it loaded (path and version) at the top. Use `-dll <path>` to test any other copy.
-
-Also note: NINA shows the firmware as "2.84", but it prints the low byte of a BCD
-number in decimal. The camera's real firmware is **2.54**, the gate-array version
-DL shipped in 2022 as the fix for the RBI-preflash bug, so the firmware is current.
+NINA's firmware display can also be misleading: the reviewed source prints the
+low byte of the BCD value in decimal. If the camera returns raw `0x0254`, NINA
+shows `2.84` while BCD decoding gives `2.54`. Check the raw value in this report;
+that observation alone does not establish that every firmware component is current.
 
 ## Quick start
 
@@ -211,3 +212,27 @@ sbigdiag-win64.exe bad1.fits bad2.xisf      analyse existing files (FITS or unco
   - Runs the whole program against a built-in simulated STXL that reproduces the fault.
   - Smoke-tests both exes on a Windows runner: simulator, FITS analysis, and a clean error when the driver is missing.
   - Publishes releases on `v*` tags.
+
+## Offline image limits
+
+FITS and uncompressed XISF inputs are bounded to 32 million pixels, 65535 pixels
+per axis, and 256 MiB of sample data. Invalid dimensions, overflow, truncated attachments, unsupported
+sample types, and nonfinite or out-of-range values produce a per-file error. XISF
+currently accepts only two-dimensional monochrome images; color and compressed
+images must be exported as monochrome uncompressed files or FITS first. Non-UInt16
+XISF samples are scaled to the 16-bit range; the console states when conversion
+or rounding was applied. Such converted samples are not the original camera ADU
+values. FITS uses physical values from BSCALE/BZERO, rounds fractional values to
+integer ADU with a notice, and never infers normalization from DATAMAX. Undefined
+BLANK pixels and 64-bit integer FITS images are rejected. A batch with any failed
+input returns a nonzero exit status while still analyzing its valid files.
+
+Live and offline dark/bias classifications use the same rules when `IMAGETYP`
+explicitly identifies a dark or bias frame. A high median alone is not called
+saturation; saturation classification uses the measured near-full-scale fraction.
+
+Persistent camera-option experiments require a known camera serial and a saved
+recovery journal before writing any option. Unknown camera identity or an
+unwritable journal skips these experiments. Failed exposure/readout cleanup stops
+further experiments; any retained pixels are diagnostic evidence, not a successful
+acquisition.

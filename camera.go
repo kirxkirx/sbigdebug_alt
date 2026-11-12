@@ -621,30 +621,32 @@ func (s ExposureSpec) Describe() string {
 }
 
 type Frame struct {
-	Spec          ExposureSpec
-	W, H          int
-	Pix           []uint16
-	Start         time.Time
-	IntegrDone    time.Duration // start -> integration complete reported
-	ReadoutTime   time.Duration
-	LineTimes     []time.Duration
-	TempBefore    TempStatus
-	TempAfter     TempStatus
-	LinkBefore    LinkStatus
-	LinkAfter     LinkStatus
-	LinkValid     bool // both link-status queries succeeded
-	PowerLowAfter string
-	Errors        []string
-	DCPs          map[string]uint32
-	Phases        [4]time.Duration // time seen in XES_IDLE, PRE_EXP (RBI preflash / shutter), INTEGRATING, POST_EXP
-	PhasesValid   bool
-	LinesRead     int // lines actually read (== H for a complete frame)
+	Spec           ExposureSpec
+	W, H           int
+	Pix            []uint16
+	Start          time.Time
+	IntegrDone     time.Duration // start -> integration complete reported
+	ReadoutTime    time.Duration
+	LineTimes      []time.Duration
+	TempBefore     TempStatus
+	TempAfter      TempStatus
+	LinkBefore     LinkStatus
+	LinkAfter      LinkStatus
+	LinkValid      bool // both link-status queries succeeded
+	PowerLowAfter  string
+	Errors         []string
+	DCPs           map[string]uint32
+	Phases         [4]time.Duration // time seen in XES_IDLE, PRE_EXP (RBI preflash / shutter), INTEGRATING, POST_EXP
+	PhasesValid    bool
+	LinesRead      int  // lines actually read (== H for a complete frame)
+	StateUncertain bool // failed cleanup; never present retained pixels as a successful acquisition
 }
 
 var errAborted = errors.New("aborted by user")
+var errCameraState = errors.New("camera cleanup failed; connection state is uncertain")
 
 // Expose runs one complete exposure + readout.
-func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
+func (c *Camera) Expose(s ExposureSpec, abort func() bool) (frame *Frame, err error) {
 	if c.Info == nil {
 		if _, err := c.CCDInfo(0); err != nil {
 			return nil, err
@@ -699,6 +701,21 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	if err := c.cmd(CC_START_EXPOSURE2, p, nil); err != nil {
 		return nil, err
 	}
+	exposureActive, readoutPending := true, true
+	defer func() {
+		// EndExposure can start frame-buffer readout on STX/STXL. Always
+		// finish readout as well, including cancellation during integration.
+		var cleanup error
+		if exposureActive {
+			cleanup = c.endExposure(ABORT_DONT_END)
+		}
+		if readoutPending {
+			cleanup = errors.Join(cleanup, c.cmd(CC_END_READOUT, L_EndReadoutParams.New(), nil))
+		}
+		if cleanup != nil {
+			err = errors.Join(err, errCameraState, cleanup)
+		}
+	}()
 	// Poll for the end of integration. CC_QUERY_COMMAND_STATUS2 also reports the
 	// exposure phase (pre-exposure = RBI preflash / shutter motion, integrating, post).
 	q := L_QueryCommandStatusParams.New()
@@ -708,7 +725,6 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	last := time.Now()
 	for {
 		if abort != nil && abort() {
-			c.endExposure(ABORT_DONT_END)
 			return nil, errAborted
 		}
 		var status uint16
@@ -732,7 +748,6 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 		if useV1 {
 			r1 := L_QueryCommandStatusResults.New()
 			if err := c.cmd(CC_QUERY_COMMAND_STATUS, q, r1); err != nil {
-				c.endExposure(ABORT_DONT_END)
 				return nil, err
 			}
 			status = L_QueryCommandStatusResults.U16(r1, "status")
@@ -741,15 +756,15 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 			break
 		}
 		if time.Now().After(deadline) {
-			c.endExposure(ABORT_DONT_END)
 			return nil, fmt.Errorf("timeout waiting for integration to complete (status=0x%04x)", status)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	f.IntegrDone = time.Since(f.Start)
 	if err := c.endExposure(0); err != nil {
-		f.Errors = append(f.Errors, err.Error())
+		return nil, errors.Join(errCameraState, err)
 	}
+	exposureActive = false
 	// Readout.
 	sr := L_StartReadoutParams.New()
 	L_StartReadoutParams.Put16(sr, "ccd", CCD_IMAGING)
@@ -760,8 +775,6 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	L_StartReadoutParams.Put16(sr, "width", uint16(w))
 	t0 := time.Now()
 	if err := c.cmd(CC_START_READOUT, sr, nil); err != nil {
-		er := L_EndReadoutParams.New()
-		_ = c.cmd(CC_END_READOUT, er, nil)
 		return nil, err
 	}
 	rl := L_ReadoutLineParams.New()
@@ -798,10 +811,14 @@ func (c *Camera) Expose(s ExposureSpec, abort func() bool) (*Frame, error) {
 	}
 	er := L_EndReadoutParams.New()
 	L_EndReadoutParams.Put16(er, "ccd", CCD_IMAGING)
-	if err := c.cmd(CC_END_READOUT, er, nil); err != nil {
-		f.Errors = append(f.Errors, err.Error())
-	}
+	endErr := c.cmd(CC_END_READOUT, er, nil)
+	readoutPending = false
 	f.ReadoutTime = time.Since(t0)
+	if endErr != nil {
+		f.LinkValid = false // No after-readout counter or power query was performed.
+		f.PowerLowAfter = "n/a"
+		return f, errors.Join(readErr, errCameraState, endErr)
+	}
 	f.TempAfter = c.Temperature()
 	if la, err := c.LinkStatus(); err == nil {
 		f.LinkAfter = la

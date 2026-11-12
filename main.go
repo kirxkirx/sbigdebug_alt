@@ -560,10 +560,12 @@ func runCamera(o options) (code int) {
 
 func analyzeFiles(paths []string, o options) int {
 	var files []string
+	failed := false
 	for _, p := range paths {
 		st, err := os.Stat(p)
 		if err != nil {
 			fmt.Printf("%s: %v\n", p, err)
+			failed = true
 			continue
 		}
 		if st.IsDir() {
@@ -584,12 +586,16 @@ func analyzeFiles(paths []string, o options) int {
 		pix, w, h, hdr, err := ReadImage(f)
 		if err != nil {
 			fmt.Printf("\n--- %s: %v\n", f, err)
+			failed = true
 			continue
 		}
 		fmt.Printf("\n--- file %d: %s ---\n", i+1, f)
 		fmt.Printf("  EXPTIME=%s IMAGETYP=%s XBINNING=%s CCD-TEMP=%s DATE-OBS=%s INSTRUME=%s\n",
 			hdr["EXPTIME"], hdr["IMAGETYP"], hdr["XBINNING"], hdr["CCD-TEMP"], hdr["DATE-OBS"], hdr["INSTRUME"])
-		a := Analyze(pix, w, h)
+		if conversion := hdr["SBIGDIAG_CONVERSION"]; conversion != "" {
+			fmt.Println("  Sample conversion:", conversion)
+		}
+		a := AnalyzeFrame(pix, w, h, darkImageType(hdr["IMAGETYP"]))
 		fmt.Printf("  => %s\n", a.Class)
 		for _, l := range a.Summary() {
 			fmt.Println("  " + l)
@@ -602,6 +608,9 @@ func analyzeFiles(paths []string, o options) int {
 	}
 	fmt.Println("\n" + levelLegend)
 	s.PrintTable()
+	if failed {
+		return 1
+	}
 	return 0
 }
 
